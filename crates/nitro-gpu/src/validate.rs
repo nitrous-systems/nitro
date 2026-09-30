@@ -9,8 +9,8 @@ use nitro_core::IRect;
 
 use crate::backend::{BackendError, RingRequest};
 use crate::proto::{
-    AR24, Composite, DeviceInfo, DmabufDesc, ErrorCode, MAX_EDGE, MAX_RING, MOD_INVALID,
-    ShadowDesc, XR24, plane_count,
+    AR24, Composite, DeviceInfo, DmabufDesc, ErrorCode, Layer, MAX_EDGE, MAX_LAYERS, MAX_RING,
+    MOD_INVALID, ShadowDesc, XR24, plane_count,
 };
 
 /// What kind of buffer a texture came from.
@@ -217,8 +217,39 @@ pub fn composite(
     if c.fence_mask >> c.layers.len() != 0 {
         return Err(err(ErrorCode::Fences, "fence bit without a layer"));
     }
-    let bounds = IRect::new(0, 0, crate::px(out.w), crate::px(out.h));
-    for (i, l) in c.layers.iter().enumerate() {
+    layers(&c.layers, &tex, out.w, out.h)
+}
+
+/// A capture (#3962): a `w`×`h` temporary target and its layers, checked
+/// as a frame's (no ring involved).
+///
+/// # Errors
+/// A bad size, too many layers, an unknown texture, an empty or
+/// out-of-bounds destination, a source rect outside its texture.
+pub fn capture(
+    w: u32,
+    h: u32,
+    ls: &[Layer],
+    tex: impl Fn(u32) -> Option<TexInfo>,
+) -> Result<(), BackendError> {
+    if !edge_ok(w) || !edge_ok(h) {
+        return Err(err(ErrorCode::BadRect, format!("size {w}x{h}")));
+    }
+    if ls.len() > MAX_LAYERS {
+        return Err(err(ErrorCode::TooMany, format!("{} layers", ls.len())));
+    }
+    layers(ls, &tex, w, h)
+}
+
+#[allow(clippy::many_single_char_names)] // x, y, w, h of a rect
+fn layers(
+    ls: &[Layer],
+    tex: &impl Fn(u32) -> Option<TexInfo>,
+    out_w: u32,
+    out_h: u32,
+) -> Result<(), BackendError> {
+    let bounds = IRect::new(0, 0, crate::px(out_w), crate::px(out_h));
+    for (i, l) in ls.iter().enumerate() {
         let Some(t) = tex(l.tex) else {
             return Err(err(
                 ErrorCode::BadId,
@@ -252,7 +283,7 @@ pub fn composite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{FormatMod, Layer, NV12, PlaneDesc};
+    use crate::proto::{FormatMod, NV12, PlaneDesc};
 
     fn info() -> DeviceInfo {
         DeviceInfo {
@@ -433,5 +464,33 @@ mod tests {
             ..Composite::default()
         };
         assert_eq!(composite(&c, t, out).unwrap_err().code, ErrorCode::NoRing);
+    }
+
+    #[test]
+    fn capture_checks() {
+        let t = |id| {
+            (id == 1).then_some(TexInfo {
+                kind: TexKind::Dmabuf,
+                w: 10,
+                h: 10,
+                fourcc: NV12,
+            })
+        };
+        let layer = Layer {
+            tex: 1,
+            src: [0.0, 0.0, 10.0, 10.0],
+            dst: IRect::new(5, 5, 20, 20),
+            ..Layer::default()
+        };
+        assert!(capture(40, 30, &[layer], t).is_ok());
+        assert!(capture(40, 30, &[], t).is_ok());
+        assert_eq!(capture(0, 30, &[layer], t).unwrap_err().code, ErrorCode::BadRect);
+        assert_eq!(capture(20, 20, &[layer], t).unwrap_err().code, ErrorCode::BadRect);
+        assert_eq!(
+            capture(40, 30, &[Layer { tex: 9, ..layer }], t).unwrap_err().code,
+            ErrorCode::BadId
+        );
+        let many = vec![layer; MAX_LAYERS + 1];
+        assert_eq!(capture(40, 30, &many, t).unwrap_err().code, ErrorCode::TooMany);
     }
 }

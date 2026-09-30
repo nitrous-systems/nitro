@@ -60,6 +60,7 @@ stream (bad framing) ends it.
 | 0x08 | `ReadBack{out_idx}` (debug/test; waits for the GPU) | 0 | `ReadBackReply{w, h, stride}` + sealed memfd |
 | 0x09 | `GetStats` | 0 | `Stats{frames, imports, errors, textures_live, in_flight, submit µs avg/max, shadow_path, drm_total, drm_resident, rss, pss}` |
 | 0x0a | `Shutdown` | 0 | — |
+| 0x0b | `Capture{serial, w, h, layers[]}` (a screenshot, #3962; waits for the GPU) | 0 | `Captured{serial, w, h, stride}` (op 0x89) + sealed memfd of linear BGRX |
 
 Limits: 16 layers, 64 rects, 4 planes, 32 modifiers, 16384 px edges.
 Encode checks the fd count against the message on the sending side too,
@@ -77,7 +78,14 @@ block.
 **Fences.** The helper keeps a dup of each frame's sync_file and polls it
 next to the socket. When the fence signals, that frame's texture
 references drop and its slot is free. Nothing in the helper waits on the
-GPU except `ReadBack`, a re-alloc of the ring, and teardown.
+GPU except `ReadBack`, `Capture`, a re-alloc of the ring, and teardown.
+
+**Capture** (protocol v2, #3962) draws its layers into a temporary
+`w`×`h` XR24 target (LINEAR preferred), copies it to a staging buffer,
+and frees both before it answers: a shot leaves nothing allocated. It
+needs no ring, so a helper started on demand for a shot can answer it
+without an output in mode 2. Pixels no layer covers are undefined; the
+server only reads the layers' `dst` rects.
 
 ## Modules
 

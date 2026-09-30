@@ -106,6 +106,10 @@ pub struct Client {
     /// Whether the socket is registered for `OUT` as well as `IN`, so the
     /// server modifies epoll only when that changes (#3947).
     pub out_armed: bool,
+    /// A reply is deferred (a `shot` waiting for the GPU helper, #3962):
+    /// later lines stay in `input` until it is sent, so replies keep
+    /// their order.
+    pub waiting: bool,
 }
 
 impl Client {
@@ -121,6 +125,7 @@ impl Client {
             output: Vec::new(),
             written: 0,
             out_armed: false,
+            waiting: false,
         })
     }
 

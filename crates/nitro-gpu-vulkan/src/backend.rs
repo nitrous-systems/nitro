@@ -19,7 +19,7 @@ use ash::vk;
 use nitro_core::IRect;
 use nitro_gpu::proto::{
     AR24, DeviceInfo, DmabufDesc, ErrorCode, Layer, MOD_LINEAR, NV12, ShadowDesc, ShadowPath,
-    SlotLayout,
+    SlotLayout, XR24,
 };
 use nitro_gpu::{Backend, BackendError, Readback, Ring, RingRequest};
 
@@ -561,18 +561,32 @@ impl VkBackend {
         // SAFETY: waits for all work; afterwards no slot object is in use.
         unsafe {
             let _ = d.device_wait_idle();
-            for s in self.slots.drain(..) {
-                for w in s.waits {
-                    d.destroy_semaphore(w, None);
-                }
-                d.destroy_semaphore(s.done, None);
-                d.destroy_fence(s.fence, None);
-                d.free_command_buffers(self.pool, &[s.cmd]);
-                d.destroy_framebuffer(s.fb, None);
-                d.destroy_image_view(s.view, None);
-                d.destroy_image(s.image, None);
-                d.free_memory(s.mem, None);
+            for s in std::mem::take(&mut self.slots) {
+                self.destroy_slot(s);
             }
+        }
+    }
+
+    /// Free one slot's objects.
+    ///
+    /// # Safety
+    /// Nothing submitted with the slot is still executing.
+    unsafe fn destroy_slot(&self, s: Slot) {
+        let d = &self.gpu.device;
+        // SAFETY: the caller's promise; null handles are no-ops.
+        unsafe {
+            for w in s.waits {
+                d.destroy_semaphore(w, None);
+            }
+            d.destroy_semaphore(s.done, None);
+            d.destroy_fence(s.fence, None);
+            if s.cmd != vk::CommandBuffer::null() {
+                d.free_command_buffers(self.pool, &[s.cmd]);
+            }
+            d.destroy_framebuffer(s.fb, None);
+            d.destroy_image_view(s.view, None);
+            d.destroy_image(s.image, None);
+            d.free_memory(s.mem, None);
         }
     }
 
@@ -621,17 +635,7 @@ impl VkBackend {
             Ok((layout, modifier, fd)) => Ok((slot, layout, modifier, fd)),
             Err(e) => {
                 // SAFETY: nothing was submitted with these objects.
-                unsafe {
-                    d.destroy_semaphore(slot.done, None);
-                    d.destroy_fence(slot.fence, None);
-                    if slot.cmd != vk::CommandBuffer::null() {
-                        d.free_command_buffers(self.pool, &[slot.cmd]);
-                    }
-                    d.destroy_framebuffer(slot.fb, None);
-                    d.destroy_image_view(slot.view, None);
-                    d.destroy_image(slot.image, None);
-                    d.free_memory(slot.mem, None);
-                }
+                unsafe { self.destroy_slot(slot) };
                 Err(e)
             }
         }
@@ -757,7 +761,7 @@ impl VkBackend {
     }
 
     #[allow(clippy::too_many_lines)] // one frame: barriers, pass, per-rect per-layer draws
-    fn record(&self, slot: &Slot, clip: &[IRect], layers: &[(&Tex, Layer)]) {
+    fn record(&self, slot: &Slot, size: (u32, u32), clip: &[IRect], layers: &[(&Tex, Layer)]) {
         let d = &self.gpu.device;
         let cmd = slot.cmd;
         let foreign = vk::QUEUE_FAMILY_FOREIGN_EXT;
@@ -824,7 +828,7 @@ impl VkBackend {
                 (vk::AccessFlags::SHADER_READ, vk::AccessFlags::empty()),
             ));
         }
-        let (w, h) = (self.out_w as f32, self.out_h as f32);
+        let (w, h) = (size.0 as f32, size.1 as f32);
         let area = clip.iter().fold(IRect::EMPTY, |a, r| a.union(r));
         // SAFETY: `cmd` is this slot's command buffer, reset and not in
         // use (its fence was waited on by the caller); every handle
@@ -845,8 +849,8 @@ impl VkBackend {
                 let full = vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent: vk::Extent2D {
-                        width: self.out_w,
-                        height: self.out_h,
+                        width: size.0,
+                        height: size.1,
                     },
                 };
                 let ra = if slot.fresh { full } else { rect2d(area) };
@@ -1214,7 +1218,7 @@ impl Backend for VkBackend {
             )
             .map_err(be("vkBeginCommandBuffer"))?;
         }
-        self.record(slot, clip, layers);
+        self.record(slot, (self.out_w, self.out_h), clip, layers);
         let slot = &self.slots[out_idx];
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
         let cmds = [slot.cmd];
@@ -1301,7 +1305,7 @@ impl Backend for VkBackend {
                 Bound::Buffer(buf),
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
-            let r = self.readback_into(slot.image, buf, mem, len);
+            let r = self.readback_into(slot.image, buf, mem, (w, h));
             // SAFETY: the copy finished (waited in `readback_into`) or
             // was never submitted.
             unsafe { d.free_memory(mem, None) };
@@ -1317,6 +1321,109 @@ impl Backend for VkBackend {
             stride: w * 4,
         })
     }
+
+    fn capture(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: &[(&Tex, Layer)],
+    ) -> Result<Readback, BackendError> {
+        // A one-slot "ring" of the capture's size: the same render pass,
+        // pipelines and layouts as a frame, freed before returning, so a
+        // shot leaves nothing allocated (#3962). LINEAR first: the cheapest
+        // copy out, and every driver renders to it.
+        let mut modifiers: Vec<u64> = self
+            .gpu
+            .info
+            .render
+            .iter()
+            .filter(|f| f.fourcc == XR24)
+            .map(|f| f.modifier)
+            .collect();
+        modifiers.sort_by_key(|m| *m != MOD_LINEAR);
+        modifiers.dedup();
+        if modifiers.is_empty() {
+            return Err(BackendError::with_code(
+                ErrorCode::BadFormat,
+                "no XR24 render modifier",
+            ));
+        }
+        let req = RingRequest {
+            n: 1,
+            w,
+            h,
+            fourcc: XR24,
+            modifiers,
+        };
+        let (slot, _, _, export) = self.new_slot(&req)?;
+        drop(export);
+        let d = &self.gpu.device;
+        let full = [IRect::new(0, 0, crate_px(w), crate_px(h))];
+        // SAFETY: a fresh slot: its command buffer and fence are unused.
+        let r = unsafe {
+            (|| {
+                d.begin_command_buffer(
+                    slot.cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(be("vkBeginCommandBuffer"))?;
+                self.record(&slot, (w, h), &full, layers);
+                d.end_command_buffer(slot.cmd)
+                    .map_err(be("vkEndCommandBuffer"))?;
+                d.reset_fences(&[slot.fence]).map_err(be("vkResetFences"))?;
+                let cmds = [slot.cmd];
+                d.queue_submit(
+                    self.gpu.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    slot.fence,
+                )
+                .map_err(be("vkQueueSubmit(capture)"))?;
+                self.wait(slot.fence)
+            })()
+        };
+        let res = r.and_then(|()| {
+            let len = w as usize * h as usize * 4;
+            let bci = vk::BufferCreateInfo::default()
+                .size(len as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: valid create info.
+            let buf = unsafe { d.create_buffer(&bci, None) }.map_err(be("vkCreateBuffer"))?;
+            let r = (|| {
+                let mem = self.alloc_bind(
+                    Bound::Buffer(buf),
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )?;
+                let r = self.readback_into(slot.image, buf, mem, (w, h));
+                // SAFETY: the copy finished or was never submitted.
+                unsafe { d.free_memory(mem, None) };
+                r
+            })();
+            // SAFETY: as above.
+            unsafe { d.destroy_buffer(buf, None) };
+            r
+        });
+        // SAFETY: the draw and the copy were waited for (or a wait failed:
+        // then wait for the whole device before freeing).
+        unsafe {
+            if res.is_err() {
+                let _ = d.device_wait_idle();
+            }
+            self.destroy_slot(slot);
+        }
+        let bytes = res?;
+        let memfd = nitro_shm::memfd_with("nitro-gpu-capture", &bytes)
+            .map_err(|e| BackendError::new(e.to_string()))?;
+        Ok(Readback {
+            memfd,
+            stride: w * 4,
+        })
+    }
+}
+
+fn crate_px(v: u32) -> i32 {
+    i32::try_from(v).unwrap_or(i32::MAX)
 }
 
 impl VkBackend {
@@ -1325,8 +1432,9 @@ impl VkBackend {
         image: vk::Image,
         buf: vk::Buffer,
         mem: vk::DeviceMemory,
-        len: usize,
+        (width, height): (u32, u32),
     ) -> Result<Vec<u8>, BackendError> {
+        let len = width as usize * height as usize * 4;
         let d = &self.gpu.device;
         let cmd = self.cmd_buffer()?;
         let fence = self.fence(false)?;
@@ -1354,8 +1462,8 @@ impl VkBackend {
                 layer_count: 1,
             },
             image_extent: vk::Extent3D {
-                width: self.out_w,
-                height: self.out_h,
+                width,
+                height,
                 depth: 1,
             },
             ..vk::BufferImageCopy::default()

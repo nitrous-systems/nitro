@@ -13,7 +13,8 @@ use nitro_core::IRect;
 
 use crate::backend::{Backend, BackendError, Readback, Ring, RingRequest};
 use crate::proto::{
-    AR24, DeviceInfo, DmabufDesc, FormatMod, Layer, MOD_I915_X_TILED, MOD_LINEAR, NV12, ShadowDesc,
+    AR24, DeviceInfo, DmabufDesc, FormatMod, Layer, MOD_I915_X_TILED, MOD_I915_Y_TILED, MOD_LINEAR,
+    NV12, ShadowDesc,
     ShadowPath, SlotLayout, XR24,
 };
 
@@ -34,6 +35,8 @@ pub enum Call {
     Release(u32),
     /// `readback(slot)`.
     Readback(usize),
+    /// `capture(w, h, layers' texture ids)`.
+    Capture(u32, u32, Vec<u32>),
 }
 
 /// Shared state; the test keeps a clone of the handle.
@@ -53,7 +56,16 @@ pub struct FakeState {
     /// While set, `composite` does not return: the helper hangs mid-frame
     /// (tests of the server's hang detection). Clear it to let go.
     pub stall: bool,
+    /// Make the next capture fail with a backend error.
+    pub fail_next_capture: bool,
+    /// What `capture` fills every layer's `dst` with, `[b, g, r, x]`
+    /// (the fake samples nothing). All zero means the default
+    /// [`CAPTURE_COLOR`].
+    pub capture_color: [u8; 4],
 }
+
+/// The fake's capture colour unless [`FakeState::capture_color`] is set.
+pub const CAPTURE_COLOR: [u8; 4] = [0x90, 0x60, 0x30, 0xff];
 
 /// The fake. Its textures are just their ids.
 #[derive(Debug, Clone, Default)]
@@ -122,7 +134,20 @@ impl Backend for FakeBackend {
         DeviceInfo {
             device: "fake".into(),
             driver: "fake".into(),
-            sampleable: vec![lin(XR24), lin(AR24), lin(NV12)],
+            sampleable: vec![
+                lin(XR24),
+                lin(AR24),
+                lin(NV12),
+                // What a VA-API decoder and Chromium hand over (#3962).
+                FormatMod {
+                    fourcc: NV12,
+                    modifier: MOD_I915_Y_TILED,
+                },
+                FormatMod {
+                    fourcc: XR24,
+                    modifier: MOD_I915_Y_TILED,
+                },
+            ],
             render: vec![
                 lin(XR24),
                 FormatMod {
@@ -210,6 +235,42 @@ impl Backend for FakeBackend {
 
     fn release(&mut self, t: u32) {
         self.record(Call::Release(t));
+    }
+
+    fn capture(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: &[(&u32, Layer)],
+    ) -> Result<Readback, BackendError> {
+        self.record(Call::Capture(w, h, layers.iter().map(|(t, _)| **t).collect()));
+        if std::mem::take(&mut self.state().fail_next_capture) {
+            return Err(err("fake capture failure"));
+        }
+        while self.state().stall {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let color = match self.state().capture_color {
+            [0, 0, 0, 0] => CAPTURE_COLOR,
+            c => c,
+        };
+        let stride = w as usize * 4;
+        let mut px = vec![0u8; stride * h as usize];
+        for (_, l) in layers {
+            let d = l.dst;
+            for y in d.y.max(0)..d.bottom().min(h.cast_signed()) {
+                for x in d.x.max(0)..d.right().min(w.cast_signed()) {
+                    let o = y as usize * stride + x as usize * 4;
+                    px[o..o + 4].copy_from_slice(&color);
+                }
+            }
+        }
+        let memfd = nitro_shm::memfd_with("nitro-gpu-fake-capture", &px)
+            .map_err(|e| err(&e.to_string()))?;
+        Ok(Readback {
+            memfd,
+            stride: w * 4,
+        })
     }
 
     fn readback(&mut self, out_idx: usize) -> Result<Readback, BackendError> {

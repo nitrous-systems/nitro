@@ -117,7 +117,7 @@ use nitro_raster::{
 };
 use nitro_scene::{
     ColorMatrix as SceneColorMatrix, ColorRange as SceneColorRange, Fill as SceneFill, OutputId,
-    PaintItem, PaintKind, Scene, SurfaceColor,
+    BufferKey, PaintItem, PaintKind, Scene, SurfaceColor,
 };
 use nitro_wire::types::format;
 
@@ -1077,10 +1077,54 @@ pub fn paint_region(
             cursor,
             palette,
             fast_scaled,
+            None,
         );
     }
     items.clear();
     duration_us(start.elapsed())
+}
+
+/// Repaint `region` of a screenshot's copy of the shadow (#3962) with
+/// every Surface in it shown from its buffer when `readable(buffer)`
+/// says the CPU may read it now, and cleared to a hole otherwise (the
+/// helper's capture, or the placeholder, fills those). Arguments as
+/// [`paint_region`]; never uses the fast scaled path.
+#[allow(clippy::too_many_arguments)] // As `paint_region`.
+pub fn paint_shot_region(
+    canvas: &mut Canvas<'_>,
+    scene: &Scene,
+    text: &mut TextEngine,
+    icons: &mut IconEngine,
+    output: OutputId,
+    origin: (i32, i32),
+    region: &[IRect],
+    cursor: (&Cursor, CursorState),
+    items: &mut Vec<PaintItem>,
+    palette: &Palette,
+    readable: &dyn Fn(BufferKey) -> bool,
+) {
+    for clip in region {
+        let clip = clip.intersect(&canvas.bounds());
+        if clip.is_empty() {
+            continue;
+        }
+        items.clear();
+        scene.paint_list(output, &clip.translate(origin.0, origin.1), items);
+        localize_items(items, origin);
+        paint_clip(
+            canvas,
+            scene,
+            text,
+            icons,
+            &clip,
+            items,
+            cursor,
+            palette,
+            false,
+            Some(readable),
+        );
+    }
+    items.clear();
 }
 
 /// [`paint_region`] for many small rects close together — the thin
@@ -1170,6 +1214,7 @@ pub fn paint_region_shared(
             cursor,
             palette,
             fast_scaled,
+            None,
         );
     }
     items.clear();
@@ -1189,6 +1234,7 @@ fn paint_clip(
     cursor: (&Cursor, CursorState),
     palette: &Palette,
     fast_scaled: bool,
+    shot: Option<&dyn Fn(BufferKey) -> bool>,
 ) {
     let (width, height) = (canvas.width(), canvas.height());
     let (cursor_image, cursor_state) = cursor;
@@ -1223,7 +1269,7 @@ fn paint_clip(
         if fast_scaled && paint_xrgb_scaled(canvas, clip, item, scene) {
             continue;
         }
-        paint_item(canvas, clip, item, scene, text, icons, palette);
+        paint_item_as(canvas, clip, item, scene, text, icons, palette, shot);
     }
     if cursor_state.visible {
         cursor_image.paint(
@@ -1634,7 +1680,6 @@ fn paint_xrgb_scaled(
 }
 
 /// Draw one paint item, already clipped by the caller to a damage rect.
-#[allow(clippy::too_many_lines)] // One arm per kind.
 fn paint_item(
     canvas: &mut Canvas<'_>,
     clip: &IRect,
@@ -1644,9 +1689,53 @@ fn paint_item(
     icons: &mut IconEngine,
     palette: &Palette,
 ) {
+    paint_item_as(canvas, clip, item, scene, text, icons, palette, None);
+}
+
+/// [`paint_item`], or with `shot` a screenshot's view of it (#3962): a
+/// Surface whose buffer `shot` says the CPU may read is drawn from it —
+/// a hole included — and any other Surface is cleared to a hole for the
+/// helper's capture (or the placeholder) to fill, not painted grey.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One arm per kind.
+fn paint_item_as(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    scene: &Scene,
+    text: &mut TextEngine,
+    icons: &mut IconEngine,
+    palette: &Palette,
+    shot: Option<&dyn Fn(BufferKey) -> bool>,
+) {
     let clip = clip.intersect(&item.clip);
     if clip.is_empty() {
         return;
+    }
+    if let Some(readable) = shot {
+        let surface = match item.kind {
+            PaintKind::Hole { size } => scene
+                .node(item.node)
+                .ok()
+                .and_then(nitro_scene::Node::surface)
+                .and_then(|s| s.content)
+                .map(|c| (size, c.buffer, c.src, c.color)),
+            PaintKind::Surface {
+                size,
+                buffer,
+                src,
+                color,
+                ..
+            } => Some((size, buffer, src, color)),
+            _ => None,
+        };
+        if let Some((size, buffer, src, color)) = surface {
+            if readable(buffer) {
+                paint_surface(canvas, &clip, item, scene, size, buffer, src, color);
+            } else {
+                canvas.clear_irect(&clip, &item.bounds);
+            }
+            return;
+        }
     }
     match item.kind {
         PaintKind::Hole { .. } => {

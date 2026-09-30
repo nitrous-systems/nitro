@@ -4,14 +4,22 @@
 //! line each (`\n`-terminated, ASCII). Replies start with a status line —
 //! `ok ...\n` or `err <message>\n` — followed by a request-specific body:
 //!
-//! A `shot` is `ARGB8888` with alpha 255 everywhere: holes punched for
-//! Surfaces on an underlay plane (#3898) are filled from the Surface when
-//! it is CPU-readable, otherwise with `frame::HOLE_PLACEHOLDER` grey. A
-//! `shot-front` is the raw scanout bytes, premultiplied alpha included.
+//! A `shot` is `ARGB8888` with alpha 255 everywhere and shows what is on
+//! screen (#3962): Surfaces on planes or composited by the GPU helper are
+//! filled in from their buffer — on the CPU when it is CPU-readable, by a
+//! helper `Capture` when it is tiled — and only a Surface neither can
+//! draw shows `frame::HOLE_PLACEHOLDER` grey. `cursor=0` leaves the cursor
+//! out; `meta=1` appends `surfaces=N cpu=N helper=N placeholder=N
+//! reason=R` to the status line (`R`: `none`, `helper-off`,
+//! `helper-unavailable`, `helper-timeout`, `helper-refused`,
+//! `unsupported`, `too-many-layers`, `busy`). A shot that needs the
+//! helper is answered once it has, so replies on one connection stay in
+//! order but a `shot` can take a few ms. A `shot-front` is the raw
+//! scanout bytes, premultiplied alpha included.
 //!
 //! | request              | reply                                                        |
 //! |----------------------|--------------------------------------------------------------|
-//! | `shot [output-name]` | `ok <w> <h> <stride>\n` + `stride*h` bytes `ARGB8888`, a=255 |
+//! | `shot [name] [cursor=0\|1] [meta=0\|1]` | `ok <w> <h> <stride>[ meta]\n` + `stride*h` bytes `ARGB8888`, a=255 |
 //! | `shot-front [name]`  | the same, read off the **scanout** buffer; raw, for tests     |
 //! | `outputs`            | `ok\n` + one [`OutputLine`] per output + `\n`                 |
 //! | `modes`              | `ok\n` + `<name> <mode>[ *][ =]\n` lines + `\n`             |
@@ -71,8 +79,9 @@ use nitro_kms::Image;
 pub enum Request {
     /// Readback of one output (the first when unnamed): the shadow buffer
     /// when there is one, else the front buffer. Both hold the same image;
-    /// the shadow is simply cheaper to read.
-    Shot(Option<String>),
+    /// the shadow is simply cheaper to read. Surfaces on planes or
+    /// composited by the GPU helper are filled in (#3962).
+    Shot(ShotRequest),
     /// Readback of the **scanout** buffer specifically, bypassing the
     /// shadow.
     ///
@@ -147,6 +156,105 @@ pub enum Request {
     /// Raw recent samples of one statistic, for percentiles a `stats`
     /// min/mean/max cannot give.
     Samples(SampleKind),
+}
+
+/// A `shot`'s options: `shot [NAME] [cursor=0|1] [meta=0|1]`, options in
+/// any order after the optional name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShotRequest {
+    /// The output (the first when unnamed).
+    pub output: Option<String>,
+    /// Include the cursor (the default: it is what is on screen).
+    pub cursor: bool,
+    /// Append `k=v` metadata to the `ok w h stride` line. Off by default
+    /// so every existing parser of the 3-field header keeps working.
+    pub meta: bool,
+}
+
+impl Default for ShotRequest {
+    fn default() -> Self {
+        Self {
+            output: None,
+            cursor: true,
+            meta: false,
+        }
+    }
+}
+
+/// How a shot's Surfaces were filled in (#3962), for `meta=1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShotMeta {
+    /// Visible Surfaces on the output.
+    pub surfaces: u32,
+    /// Painted from their buffer on the CPU.
+    pub cpu: u32,
+    /// Composited by the GPU helper.
+    pub helper: u32,
+    /// Shown as [`crate::frame::HOLE_PLACEHOLDER`] grey.
+    pub placeholder: u32,
+    /// Why, when `placeholder > 0` (else `none`).
+    pub reason: ShotReason,
+}
+
+/// Why a shot shows a Surface as the placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShotReason {
+    /// Nothing is a placeholder.
+    #[default]
+    None,
+    /// `gpu.helper = off`: tiled buffers cannot be read.
+    HelperOff,
+    /// The helper gave up, could not start or died mid-capture.
+    HelperUnavailable,
+    /// The helper did not answer in time (it was killed).
+    HelperTimeout,
+    /// The helper refused the import or the capture.
+    HelperRefused,
+    /// A Surface neither the CPU nor the helper can draw (rotated, a
+    /// format or modifier the helper cannot sample, a fence pending).
+    Unsupported,
+    /// More Surfaces than one capture's layers.
+    TooManyLayers,
+    /// Too many shots waiting for the helper.
+    Busy,
+}
+
+impl ShotReason {
+    /// The `reason=` word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HelperOff => "helper-off",
+            Self::HelperUnavailable => "helper-unavailable",
+            Self::HelperTimeout => "helper-timeout",
+            Self::HelperRefused => "helper-refused",
+            Self::Unsupported => "unsupported",
+            Self::TooManyLayers => "too-many-layers",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+fn parse_shot<'a>(mut words: impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let mut r = ShotRequest::default();
+    let flag = |k: &str, v: &str| match v {
+        "1" | "on" | "yes" | "true" => Ok(true),
+        "0" | "off" | "no" | "false" => Ok(false),
+        _ => Err(format!("`{k}` wants 0 or 1, got `{v}`")),
+    };
+    let mut first = true;
+    for w in words.by_ref() {
+        match w.split_once('=') {
+            Some(("cursor", v)) => r.cursor = flag("cursor", v)?,
+            Some(("meta", v)) => r.meta = flag("meta", v)?,
+            Some((k, _)) => return Err(format!("unknown `shot` option `{k}`")),
+            None if first => r.output = Some(w.to_owned()),
+            None => return Err("too many arguments for `shot`".to_owned()),
+        }
+        first = false;
+    }
+    Ok(Request::Shot(r))
 }
 
 /// Which sample log `samples` reads.
@@ -266,12 +374,14 @@ pub fn parse(line: &str) -> Result<Request, String> {
     if cmd == "input" {
         return parse_input(line, words);
     }
+    if cmd == "shot" {
+        return parse_shot(words);
+    }
     let arg = words.next();
     if words.next().is_some() {
         return Err(format!("too many arguments for `{cmd}`"));
     }
     match (cmd, arg) {
-        ("shot", name) => Ok(Request::Shot(name.map(str::to_owned))),
         ("shot-front", name) => Ok(Request::ShotFront(name.map(str::to_owned))),
         ("plug", Some(size)) => {
             let (w, h) = size
@@ -503,7 +613,25 @@ pub fn ok_reply() -> Vec<u8> {
 
 /// `ok <w> <h> <stride>\n` followed by the pixel bytes.
 pub fn shot_reply(image: &Image) -> Vec<u8> {
-    let header = format!("ok {} {} {}\n", image.width, image.height, image.stride);
+    shot_reply_meta(image, None)
+}
+
+/// [`shot_reply`], with `surfaces=N cpu=N helper=N placeholder=N
+/// reason=R` after the stride when `meta` is given (`shot meta=1`).
+pub fn shot_reply_meta(image: &Image, meta: Option<&ShotMeta>) -> Vec<u8> {
+    let mut header = format!("ok {} {} {}", image.width, image.height, image.stride);
+    if let Some(m) = meta {
+        let _ = write!(
+            header,
+            " surfaces={} cpu={} helper={} placeholder={} reason={}",
+            m.surfaces,
+            m.cpu,
+            m.helper,
+            m.placeholder,
+            m.reason.as_str()
+        );
+    }
+    header.push('\n');
     let mut out = Vec::with_capacity(header.len() + image.data.len());
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&image.data);
@@ -707,11 +835,32 @@ mod tests {
 
     #[test]
     fn parses_every_request() {
-        assert_eq!(parse("shot\n"), Ok(Request::Shot(None)));
+        assert_eq!(parse("shot\n"), Ok(Request::Shot(ShotRequest::default())));
         assert_eq!(
             parse("shot HDMI-A-1\r\n"),
-            Ok(Request::Shot(Some("HDMI-A-1".to_owned())))
+            Ok(Request::Shot(ShotRequest {
+                output: Some("HDMI-A-1".to_owned()),
+                ..ShotRequest::default()
+            }))
         );
+        assert_eq!(
+            parse("shot meta=1 cursor=0"),
+            Ok(Request::Shot(ShotRequest {
+                output: None,
+                cursor: false,
+                meta: true,
+            }))
+        );
+        assert_eq!(
+            parse("shot DP-1 meta=1"),
+            Ok(Request::Shot(ShotRequest {
+                output: Some("DP-1".to_owned()),
+                meta: true,
+                ..ShotRequest::default()
+            }))
+        );
+        assert!(parse("shot cursor=2").is_err());
+        assert!(parse("shot bogus=1").is_err());
         assert_eq!(parse("shot-front\n"), Ok(Request::ShotFront(None)));
         assert_eq!(
             parse("shot-front HDMI-A-1"),

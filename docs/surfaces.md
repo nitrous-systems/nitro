@@ -64,9 +64,8 @@ correct premultiplied pixel. `Scene::set_surface_on_plane` flags a Surface,
 which then paints `PaintKind::Hole` (`Canvas::clear_irect`). The server
 switches the primary's framebuffer to AR24 (same dumb buffer, second
 AddFB2) only while `Scene::has_holes` is true and the plane lists ARGB8888;
-the test box's primary does not, so it stays XR24. `shot` fills holes with
-`frame::HOLE_PLACEHOLDER` grey until Surfaces carry CPU-readable buffers
-(#3897).
+the test box's primary does not, so it stays XR24. `shot` fills the holes
+from the Surfaces' buffers (§ Capture: shots and screen recording).
 
 ## Per-output modes: the `planes` module
 
@@ -506,6 +505,102 @@ remainder.
   mode 2 at a time (the others use planes/CPU). The ring lives as long as
   the helper. Entering mode 2 moves that output's shadow into a sealed
   memfd: the same 8 MB, counted as RssShmem instead of RssAnon.
+
+## Capture: shots and screen recording
+
+### As built: `shot` (#3962)
+
+A shot shows what is on screen. The shadow already holds everything the
+CPU composited; what it lacks is Surfaces on a plane or composited by the
+helper (holes) and Surfaces the CPU cannot read (grey in the shadow). The
+server (`crates/nitro-server/src/shot.rs`) takes a copy of the shadow and
+repaints the rects of those Surfaces into it (`frame::paint_shot_region`,
+the ordinary paint with a shot flag, so content above them is redrawn in
+order):
+
+- **CPU-readable buffers** (shm/memfd, linear dma-bufs, server-allocated
+  scanout buffers) are drawn from the buffer by `paint_surface`, scaled
+  and placed as on screen. Client dma-bufs are inside the read bracket
+  begun at latch; an early-latched one (on a plane with `IN_FENCE_FD`,
+  #3938) is read only if its fence polls signalled, bracketed for the
+  read. The server never waits on a fence for a shot.
+- **Tiled/compressed buffers** are cleared to holes and drawn by the GPU
+  helper: protocol v2 `Capture{serial, w, h, layers[]}` composites those
+  Surfaces (the same layer placement as mode 2) into a temporary linear
+  XR24 target, copies it to a staging buffer, frees both and answers
+  `Captured` + a sealed memfd. The server fills the holes from it inside
+  each layer's rect. The helper imports what it lacks for the shot and
+  the server `Release`s those textures afterwards, so an on-demand helper
+  idle-exits again. An on-demand helper that is not running is started
+  for the shot. The shot's buffers are borrowed against `BufferReleased`
+  until `Captured`.
+- **Neither**: `HOLE_PLACEHOLDER` grey, and `meta=1` says why
+  (`helper-off`, `helper-unavailable`, `helper-timeout` — 1 s, then the
+  helper is killed as hung —, `helper-refused`, `unsupported`,
+  `too-many-layers`, `busy`); the server logs it and `nitro-shot` prints
+  it.
+- The cursor is software, painted into the shadow, so it is in the shot;
+  `cursor=0` repaints its rect without it.
+- A shot waiting for the helper defers its control reply
+  (`Client::waiting`); the loop never blocks. Replies on one connection
+  stay in order.
+- **Nothing is kept.** The image copy is dropped after the reply; the
+  helper's target and staging buffer live only inside the `Capture`
+  call. Idle cost: zero bytes (measured below).
+
+Known residuals: a translucent tiled Surface is captured opaque (as mode
+2 draws it); a rotated one is the placeholder (`unsupported`).
+
+### Recording design (not built)
+
+Continuous capture for screen recording and video calls reuses the
+shot's parts; it is its own work item (issue linked from the work plan).
+
+- **Who composites.** The helper, every frame the output changes: the
+  same layer list as a mode-2 frame (shadow + Surface layers), drawn into
+  a separate capture target instead of (or besides) the scanout ring. In
+  mode 2 it is the scanout frame itself, copied or drawn twice; in modes
+  0/1/3 the helper composites the shadow (imported as in mode 2, with
+  `UploadDamage`) plus the planes' buffers. Frames with no damage are
+  skipped (the consumer keeps the previous one).
+- **The ring.** 3–4 exported capture dma-bufs per recorded output,
+  XR24 (or NV12 via a second pass for encoders that want it; the helper
+  already samples YUV and would render to an NV12 target with a
+  colour-conversion shader). Each slot carries a completion `sync_file`
+  and is returned by the consumer; with no free slot the frame is dropped
+  for the recording, never waited for. The display path never waits on a
+  consumer.
+- **Pacing.** Driven by the output's page flips (the server composites a
+  capture frame after a flip that changed pixels), capped at the
+  consumer's requested fps; damage accumulates across skipped frames.
+- **Damage** rides with every frame (the union since the consumer's last
+  frame), so encoders can use it for rate control and WebRTC for
+  region updates.
+- **Handoff, zero-copy.** A wire op pair for trusted clients:
+  `CaptureStart{output | window, max_fps, format}` →
+  `CaptureBuffers{dma-buf per slot}` once, then per frame
+  `CaptureFrame{slot, fence, damage[], time_ns}` and the client's
+  `CaptureRelease{slot}`; `CaptureStop`. A VA-API encoder imports the
+  slots once (`vaCreateSurfaces` with `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`)
+  and encodes after the fence; Chromium's WebRTC desktop capturer takes
+  the same dma-bufs as a native `VideoFrame`. A window capture composites
+  one window's subtree (`Scene::paint_window`) into a window-sized ring.
+- **Permission.** Capture is not granted by default: a new capability
+  (`caps::CAPTURE`) only for clients the shell allows — a config
+  allow-list plus a per-session prompt the shell shows ("Chromium wants
+  to share your screen: whole screen / this window / deny"). While any
+  capture runs the bar shows an indicator and the captured output gets a
+  thin border; the lock screen stops every capture (and no lock-screen
+  frame is ever captured); revocation is a `CaptureStop` from the server.
+  The control socket's `shot` stays owner-only (the socket is `0700`).
+- **Cost (estimates).** GPU time per full-output composite of shadow +
+  one video layer: 0.4–1 ms at 1080p, 0.7–1.8 ms at 1440p on KBL/HSW
+  class iGPUs (the mode-2 frame, measured at 435 µs mean submit-side on
+  box1, is the same work; a shot's `Capture` below includes allocation
+  and the copy back, which recording does not pay per frame). Damage-only
+  frames cost proportionally less. Ring memory, only while recording:
+  3 × w×h×4 = 24.9 MB at 1080p, 44.2 MB at 1440p (XR24), or 4 × 1.5 B/px
+  = 12.4 / 22.1 MB as NV12. Nothing when no capture is running.
 
 ## Video decode belongs to clients
 

@@ -61,6 +61,7 @@ pub mod remote;
 pub mod render;
 pub mod repeat;
 pub mod share;
+pub mod shot;
 pub mod shell;
 pub mod signals;
 pub mod stats;
@@ -1233,6 +1234,8 @@ struct Server {
     /// does not allocate (#3947). Each is taken with `mem::take`, used
     /// and put back empty-but-allocated.
     plan: PlanScratch,
+    /// Shots waiting for the GPU helper, and their counters (#3962).
+    shots: shot::Shots,
 }
 
 /// Reusable buffers for the per-frame plane plan and helper frame.
@@ -1582,6 +1585,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         input_events: Vec::new(),
         paint_items: Vec::new(),
         plan: PlanScratch::default(),
+        shots: shot::Shots::default(),
     };
     server.register_backend()?;
     // The deferral timer stays in the epoll set for the whole run. It is
@@ -6647,10 +6651,34 @@ impl Server {
                     keep = false;
                 }
             }
-            while keep && let Some(line) = protocol::take_line(&mut client.input) {
-                self.handle_request(&mut client, &line);
-            }
+            self.take_requests(token, &mut client);
         }
+        self.client_flush(token, client, keep);
+    }
+
+    /// Answer every complete line, stopping at a deferred reply.
+    fn take_requests(&mut self, token: u64, client: &mut Client) {
+        while !client.waiting
+            && let Some(line) = protocol::take_line(&mut client.input)
+        {
+            self.handle_request(token, client, &line);
+        }
+    }
+
+    /// A deferred reply is ready (#3962): send it, then carry on with
+    /// the lines that queued behind it. A client that has gone drops it.
+    fn control_reply(&mut self, token: u64, bytes: Vec<u8>) {
+        let Some(mut client) = self.clients.remove(&token) else {
+            return;
+        };
+        client.send(bytes);
+        client.waiting = false;
+        self.take_requests(token, &mut client);
+        self.client_flush(token, client, true);
+    }
+
+    /// Flush, re-arm epoll, and keep or drop the client.
+    fn client_flush(&mut self, token: u64, mut client: Client, mut keep: bool) {
         if keep {
             match client.flush() {
                 Ok(_) => {}
@@ -6685,7 +6713,7 @@ impl Server {
         }
     }
 
-    fn handle_request(&mut self, client: &mut Client, line: &str) {
+    fn handle_request(&mut self, token: u64, client: &mut Client, line: &str) {
         debug!("request {line:?}");
         let reply = match protocol::parse(line) {
             Err(msg) => protocol::err_reply(&msg),
@@ -6698,7 +6726,13 @@ impl Server {
                 self.gpu.query_stats(&EpollPoll(&self.epoll), TOK_GPU);
                 self.stats_reply()
             }
-            Ok(Request::Shot(name)) => self.shot(name.as_deref()),
+            Ok(Request::Shot(req)) => {
+                let Some(r) = self.shot(token, &req) else {
+                    client.waiting = true;
+                    return;
+                };
+                r
+            }
             Ok(Request::ShotFront(name)) => self.shot_front(name.as_deref()),
             Ok(Request::Quit) => {
                 info!("quit requested");
@@ -6916,6 +6950,7 @@ impl Server {
         pairs.push(("dmabuf_kms_refused", self.dmabuf_kms_refused));
         self.planes_stats(pairs);
         self.gpu_stats(pairs);
+        self.shot_stats(pairs);
         pairs.push(("dmabuf_placeholder_paints", frame::placeholder_paints()));
         pairs.push(("fences_pending", self.fences.len() as u64));
         pairs.push(("fence_waits", self.fence_waits));
@@ -9138,43 +9173,11 @@ impl Server {
         protocol::ok_reply()
     }
 
-    /// Answer a `shot`: the pixels of one output, `XRGB8888`.
-    ///
-    /// Taken from the shadow when there is one. That is both cheaper (no
-    /// uncached reads back out of the write-combined mapping) and *more*
-    /// honest: the shadow is complete by construction, whereas the front
-    /// buffer is only complete because the age-2 rule says so. The two are
-    /// byte-identical once a frame has settled, which
-    /// `tests/shadow.rs` pins.
-    ///
-    /// A shadow that has never been painted into would be black, so it is
-    /// only trusted after the first commit — before that the front buffer
-    /// is the one with real pixels in it.
-    fn shot(&mut self, name: Option<&str>) -> Vec<u8> {
-        let id = match self.shot_output(name) {
-            Ok(id) => id,
-            Err(reply) => return reply,
-        };
-        if let Some(shadow) = self
-            .outputs
-            .iter()
-            .find(|o| o.kms_id == id)
-            .and_then(|o| o.shadow.as_ref())
-            .filter(|s| s.is_complete())
-        {
-            return protocol::shot_reply(&Self::honest(shadow.image()));
-        }
-        match self.backend.read_front(id) {
-            Ok(img) => protocol::shot_reply(&Self::honest(img)),
-            Err(e) => protocol::err_reply(&e.to_string()),
-        }
-    }
-
     /// A screenshot as the user sees it: the screen's premultiplied ARGB
     /// composited over whatever is behind its holes, alpha 255 everywhere.
-    fn honest(mut image: nitro_kms::Image) -> nitro_kms::Image {
-        // #3897: sample the Surface buffer here when CPU-readable; until
-        // Surfaces carry buffers, every hole shows the placeholder.
+    pub(crate) fn honest(mut image: nitro_kms::Image) -> nitro_kms::Image {
+        // Only reached without a complete shadow (#3962 repaints the
+        // Surfaces into a copy of it otherwise): holes stay grey.
         let underlay = |_x: u32, _y: u32| frame::HOLE_PLACEHOLDER;
         frame::fill_holes(&mut image, underlay);
         image
@@ -12712,6 +12715,7 @@ impl Server {
     fn on_gpu_reply(&mut self, r: gpu::Reply) {
         match r {
             gpu::Reply::Ready => {
+                self.shots_on_ready();
                 // Outputs with helper-able Surfaces decide again.
                 for o in &mut self.outputs {
                     if !o.gpu_layers.is_empty() {
@@ -12768,6 +12772,14 @@ impl Server {
                     self.gpu_commit(i);
                 }
             }
+            gpu::Reply::Captured {
+                serial,
+                w,
+                h,
+                stride,
+                memfd,
+            } => self.shot_captured(serial, (w, h, stride), memfd),
+            gpu::Reply::CaptureFailed { serial, code } => self.shot_capture_failed(serial, code),
             gpu::Reply::CompositeFailed { serial, code } => {
                 self.gpu.counters.refused_frames += 1;
                 self.gpu.borrows.done(serial);
@@ -12847,7 +12859,11 @@ impl Server {
 
     /// The helper's timer: a restart is due, or it is not answering.
     fn on_gpu_timer(&mut self) {
+        let overdue = self.gpu.capture_overdue(Instant::now());
         let (respawn, hung) = self.gpu.on_timer();
+        if hung && overdue {
+            self.shots_fail_all(protocol::ShotReason::HelperTimeout);
+        }
         if hung {
             self.gpu.kill(&EpollPoll(&self.epoll));
             self.gpu_lost();
@@ -12901,6 +12917,7 @@ impl Server {
     /// The helper is gone (EOF, hung and killed): fall back, count, and
     /// schedule a restart.
     fn gpu_lost(&mut self) {
+        self.shots_fail_all(protocol::ShotReason::HelperUnavailable);
         let idle = self.gpu.idle();
         self.gpu_drop_owner(true, true);
         self.gpu.died(idle);
@@ -12956,6 +12973,7 @@ impl Server {
 
     /// VT switch away: stop the helper and drop what it held.
     fn gpu_pause(&mut self) {
+        self.shots_fail_all(protocol::ShotReason::HelperUnavailable);
         self.gpu_drop_owner(false, true);
         self.gpu.stop(&EpollPoll(&self.epoll), TOK_GPU);
         self.send_gpu_releases();

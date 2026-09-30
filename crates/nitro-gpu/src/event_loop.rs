@@ -22,9 +22,9 @@ use nitro_core::IRect;
 use nitro_wire::{DecodeError, Framer, Socket, Writer};
 use rustix::event::{PollFd, PollFlags, Timespec};
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Backend, BackendError, Readback};
 use crate::lifetime::TexTable;
-use crate::proto::{Composite, ErrorCode, FromHelper, Message, PROTO_VERSION, ToHelper};
+use crate::proto::{Composite, ErrorCode, FromHelper, Layer, Message, PROTO_VERSION, ToHelper};
 use crate::ring::DamageRing;
 use crate::stats::Counters;
 use crate::validate::{self, OutInfo};
@@ -352,6 +352,26 @@ impl<B: Backend> Helper<B> {
                 }
                 self.reap();
             }
+            ToHelper::Capture {
+                serial,
+                w,
+                h,
+                layers,
+            } => {
+                match self.capture(w, h, &layers) {
+                    Ok(rb) => self.send(
+                        &FromHelper::Captured {
+                            serial,
+                            w,
+                            h,
+                            stride: rb.stride,
+                        },
+                        vec![rb.memfd],
+                    ),
+                    Err(e) => self.refuse(op, serial, &e),
+                }
+                self.reap();
+            }
             ToHelper::GetStats => {
                 self.reap();
                 let s = self.counters.snapshot(
@@ -485,6 +505,23 @@ impl<B: Backend> Helper<B> {
         }
         self.send(&FromHelper::Composited { serial: c.serial }, vec![fence]);
         Ok(())
+    }
+
+    /// A screenshot: synchronous, so every texture it samples is alive
+    /// until it returns.
+    fn capture(&mut self, w: u32, h: u32, ls: &[Layer]) -> Result<Readback, BackendError> {
+        validate::capture(w, h, ls, |id| self.texs.info(id))?;
+        let mut layers = Vec::with_capacity(ls.len());
+        for l in ls {
+            let Some(t) = self.texs.get(l.tex) else {
+                return Err(BackendError::with_code(
+                    ErrorCode::BadId,
+                    "texture vanished",
+                ));
+            };
+            layers.push((t, *l));
+        }
+        self.backend.capture(w, h, &layers)
     }
 
     fn free(&mut self, freed: Vec<(u32, B::Tex)>) {

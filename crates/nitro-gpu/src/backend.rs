@@ -153,4 +153,19 @@ pub trait Backend {
     /// # Errors
     /// The copy failed.
     fn readback(&mut self, out_idx: usize) -> Result<Readback, BackendError>;
+
+    /// A screenshot (#3962): draw `layers` (bottom first, each already
+    /// validated against a `w`×`h` target) into a temporary target and
+    /// return it as linear BGRX. Blocks until the GPU is done, like
+    /// [`Backend::readback`]; everything it allocates is freed before it
+    /// returns. Pixels no layer covers are undefined.
+    ///
+    /// # Errors
+    /// Allocation, recording or the copy failed.
+    fn capture(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: &[(&Self::Tex, Layer)],
+    ) -> Result<Readback, BackendError>;
 }

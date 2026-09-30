@@ -1,7 +1,8 @@
 //! `nitro-shot`: ask the running server for a screenshot and write a PNG.
 //!
 //! ```text
-//! nitro-shot [-o FILE] [--raw] [--output NAME]   screenshot (PNG, or raw ARGB8888, alpha 255, with --raw)
+//! nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v]
+//!                                                 screenshot (PNG, or raw ARGB8888, alpha 255, with --raw)
 //! nitro-shot --outputs                            list outputs
 //! nitro-shot --modes                              list every mode each connector offers
 //! nitro-shot --stats                              frame counters
@@ -26,6 +27,10 @@ enum Mode {
     Shot {
         raw: bool,
         output: Option<String>,
+        /// Leave the cursor out (`cursor=0`).
+        no_cursor: bool,
+        /// Print the server's shot metadata to stderr.
+        verbose: bool,
     },
     Outputs,
     /// Every mode each connected connector offers — what
@@ -46,18 +51,22 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage";
+const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
     let mut raw = false;
     let mut output = None;
+    let mut no_cursor = false;
+    let mut verbose = false;
     let mut cmd: Option<Mode> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" | "--out" => file = Some(PathBuf::from(it.next().ok_or("-o needs a FILE")?)),
             "--raw" => raw = true,
+            "--no-cursor" => no_cursor = true,
+            "-v" | "--verbose" => verbose = true,
             "--output" => output = Some(it.next().ok_or("--output needs a NAME")?),
             "--outputs" => cmd = Some(Mode::Outputs),
             "--modes" => cmd = Some(Mode::Modes),
@@ -74,7 +83,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
-    let mode = cmd.unwrap_or(Mode::Shot { raw, output });
+    let mode = cmd.unwrap_or(Mode::Shot {
+        raw,
+        output,
+        no_cursor,
+        verbose,
+    });
     Ok(Args { mode, file })
 }
 
@@ -136,23 +150,52 @@ struct Shot {
     data: Vec<u8>,
 }
 
-fn read_shot(conn: &mut BufReader<UnixStream>, header: &str) -> io::Result<Shot> {
-    let fields: Vec<u32> = header
-        .split_whitespace()
-        .map(|f| f.parse::<u32>().ok())
-        .collect::<Option<_>>()
+/// `k=v` pairs after a shot's `w h stride`.
+type Meta = Vec<(String, String)>;
+
+/// `w h stride` and the `k=v` metadata after them (`shot meta=1`).
+fn parse_header(header: &str) -> Option<(u32, u32, u32, Meta)> {
+    let mut words = header.split_whitespace();
+    let mut num = || words.next()?.parse::<u32>().ok();
+    let (w, h, stride) = (num()?, num()?, num()?);
+    let meta = words
+        .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .collect::<Option<_>>()?;
+    Some((w, h, stride, meta))
+}
+
+fn read_shot(
+    conn: &mut BufReader<UnixStream>,
+    header: &str,
+) -> io::Result<(Shot, Meta)> {
+    let (width, height, stride, meta) = parse_header(header)
         .ok_or_else(|| io::Error::other(format!("bad shot header {header:?}")))?;
-    let [width, height, stride] = fields[..] else {
-        return Err(io::Error::other(format!("bad shot header {header:?}")));
-    };
     let mut data = vec![0u8; (stride as usize) * (height as usize)];
     conn.read_exact(&mut data)?;
-    Ok(Shot {
-        width,
-        height,
-        stride,
-        data,
-    })
+    Ok((
+        Shot {
+            width,
+            height,
+            stride,
+            data,
+        },
+        meta,
+    ))
+}
+
+/// Say on stderr when Surfaces could not be shown (#3962).
+fn report(meta: &[(String, String)], verbose: bool) {
+    let get = |k: &str| meta.iter().find(|(m, _)| m == k).map(|(_, v)| v.as_str());
+    if verbose {
+        let line: Vec<String> = meta.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        eprintln!("nitro-shot: {}", line.join(" "));
+    }
+    if let Some(n) = get("placeholder").filter(|n| *n != "0") {
+        eprintln!(
+            "nitro-shot: {n} surface(s) shown as placeholder ({})",
+            get("reason").unwrap_or("?")
+        );
+    }
 }
 
 fn write_out(file: Option<&PathBuf>, bytes: &[u8]) -> io::Result<()> {
@@ -168,13 +211,25 @@ fn write_out(file: Option<&PathBuf>, bytes: &[u8]) -> io::Result<()> {
 fn run(args: Args) -> io::Result<()> {
     let mut conn = connect()?;
     match args.mode {
-        Mode::Shot { raw, output } => {
-            let line = match output {
-                Some(name) => format!("shot {name}\n"),
-                None => "shot\n".to_owned(),
-            };
+        Mode::Shot {
+            raw,
+            output,
+            no_cursor,
+            verbose,
+        } => {
+            let mut line = "shot".to_owned();
+            if let Some(name) = output {
+                line.push(' ');
+                line.push_str(&name);
+            }
+            line.push_str(" meta=1");
+            if no_cursor {
+                line.push_str(" cursor=0");
+            }
+            line.push('\n');
             let header = request(&mut conn, &line)?;
-            let shot = read_shot(&mut conn, &header)?;
+            let (shot, meta) = read_shot(&mut conn, &header)?;
+            report(&meta, verbose);
             if raw {
                 write_out(args.file.as_ref(), &shot.data)
             } else {
@@ -241,17 +296,21 @@ mod tests {
             Ok(Args {
                 mode: Mode::Shot {
                     raw: false,
-                    output: None
+                    output: None,
+                    no_cursor: false,
+                    verbose: false,
                 },
                 file: None
             })
         );
         assert_eq!(
-            parse("-o x.png --raw --output HDMI-A-1"),
+            parse("-o x.png --raw --output HDMI-A-1 --no-cursor -v"),
             Ok(Args {
                 mode: Mode::Shot {
                     raw: true,
-                    output: Some("HDMI-A-1".into())
+                    output: Some("HDMI-A-1".into()),
+                    no_cursor: true,
+                    verbose: true,
                 },
                 file: Some("x.png".into())
             })
@@ -282,5 +341,18 @@ mod tests {
         assert!(parse("--input").is_err());
         assert!(parse("-o").is_err());
         assert!(parse("--frob").is_err());
+    }
+
+    #[test]
+    fn parses_shot_headers() {
+        assert_eq!(parse_header("4 2 16"), Some((4, 2, 16, vec![])));
+        let (w, h, s, m) =
+            parse_header("640 480 2560 surfaces=2 cpu=1 helper=0 placeholder=1 reason=helper-off")
+                .unwrap();
+        assert_eq!((w, h, s, m.len()), (640, 480, 2560, 5));
+        assert_eq!(m[4], ("reason".to_owned(), "helper-off".to_owned()));
+        assert_eq!(parse_header("4 2"), None);
+        assert_eq!(parse_header("4 2 x"), None);
+        assert_eq!(parse_header("4 2 16 junk"), None);
     }
 }

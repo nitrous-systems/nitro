@@ -53,6 +53,9 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HANG_TIMEOUT: Duration = Duration::from_millis(250);
 /// Ring slots.
 pub const RING_SLOTS: u32 = 3;
+/// A shot's `Capture` unanswered for this long means the helper hung
+/// (#3962). Generous: it allocates, draws and copies a whole output.
+pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Tests run the helper in-process: the server hands them its socket end
 /// instead of `exec`ing a binary ([`crate::Config::gpu_spawner`]).
@@ -327,6 +330,26 @@ pub enum Reply {
     RingFailed,
     /// The shadow import was refused.
     ShadowRefused,
+    /// A shot's capture (#3962): linear BGRX in a sealed memfd.
+    Captured {
+        /// Serial.
+        serial: u64,
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Row stride in bytes.
+        stride: u32,
+        /// The pixels.
+        memfd: OwnedFd,
+    },
+    /// A shot's capture was refused.
+    CaptureFailed {
+        /// Serial.
+        serial: u64,
+        /// The code.
+        code: proto::ErrorCode,
+    },
 }
 
 /// Counters for `stats`.
@@ -401,6 +424,8 @@ pub struct Helper {
     want_out: bool,
     /// Last activity towards the helper that holds something (on-demand).
     pub busy_since_idle: bool,
+    /// Shot captures sent and not answered (#3962): serial, sent at.
+    captures: Vec<(u64, Instant)>,
 }
 
 impl std::fmt::Debug for Helper {
@@ -468,6 +493,7 @@ impl Helper {
             last_stats: proto::Stats::default(),
             want_out: false,
             busy_since_idle: false,
+            captures: Vec::new(),
         })
     }
 
@@ -736,6 +762,7 @@ impl Helper {
                 debug!("gpu helper refused op {op:#x} ({what}): {code:?} {msg}");
                 match op {
                     proto::op::COMPOSITE => Some(Reply::CompositeFailed { serial: what, code }),
+                    proto::op::CAPTURE => Some(Reply::CaptureFailed { serial: what, code }),
                     proto::op::ALLOC_OUTPUT_RING => Some(Reply::RingFailed),
                     proto::op::IMPORT_SHADOW => {
                         ring.shadow = None;
@@ -757,6 +784,21 @@ impl Helper {
             FromHelper::Stats(s) => {
                 *last_stats = s;
                 None
+            }
+            FromHelper::Captured {
+                serial,
+                w,
+                h,
+                stride,
+            } => {
+                let memfd = fds.into_iter().next()?;
+                Some(Reply::Captured {
+                    serial,
+                    w,
+                    h,
+                    stride,
+                    memfd,
+                })
             }
             FromHelper::Imported { .. } | FromHelper::ReadBackReply { .. } => None,
         }
@@ -791,6 +833,7 @@ impl Helper {
         self.want_out = false;
         self.info = None;
         self.hello_at = None;
+        self.captures.clear();
         self.texs.clear();
         // Their fences error or signal as the driver lets go; the
         // borrows go when they do (`fence_signalled`), or now if no fence
@@ -853,6 +896,7 @@ impl Helper {
         self.info = None;
         self.hello_at = None;
         self.respawn_at = None;
+        self.captures.clear();
         self.texs.clear();
         self.ring = Ring::default();
         self.started = None;
@@ -886,7 +930,8 @@ impl Helper {
                 .ring
                 .in_flight
                 .as_ref()
-                .is_some_and(|f| now.duration_since(f.sent) >= HANG_TIMEOUT);
+                .is_some_and(|f| now.duration_since(f.sent) >= HANG_TIMEOUT)
+            || self.capture_overdue(now);
         self.arm();
         (respawn, hung)
     }
@@ -899,7 +944,8 @@ impl Helper {
     /// harmlessly: `on_timer` re-evaluates every deadline and re-arms.
     pub fn arm(&mut self) {
         let hang = self.ring.in_flight.as_ref().map(|f| f.sent + HANG_TIMEOUT);
-        let next = [self.hello_at, self.respawn_at, hang]
+        let capture = self.captures.iter().map(|c| c.1 + CAPTURE_TIMEOUT).min();
+        let next = [self.hello_at, self.respawn_at, hang, capture]
             .into_iter()
             .flatten()
             .min();
@@ -1117,6 +1163,39 @@ impl Helper {
     #[must_use]
     pub fn idle(&self) -> bool {
         self.texs.is_empty() && self.fences.is_empty() && self.owner.is_none()
+    }
+
+    /// A shot's `Capture` went out (#3962): the hang timer covers it.
+    pub fn capture_sent(&mut self, serial: u64) {
+        self.captures.push((serial, Instant::now()));
+        self.arm();
+    }
+
+    /// A shot's `Capture` was answered (or given up).
+    pub fn capture_done(&mut self, serial: u64) {
+        self.captures.retain(|c| c.0 != serial);
+    }
+
+    /// Whether a `Capture` has been out longer than [`CAPTURE_TIMEOUT`].
+    #[must_use]
+    pub fn capture_overdue(&self, now: Instant) -> bool {
+        self.captures
+            .iter()
+            .any(|c| now.duration_since(c.1) >= CAPTURE_TIMEOUT)
+    }
+
+    /// Release `key`'s texture if there is one (a shot imported it only
+    /// to capture it): nothing stays allocated for a shot (#3962).
+    pub fn release_tex(&mut self, poll: &dyn Poll, token: u64, key: BufferKey) {
+        if let Some(t) = self.texs.remove(&key) {
+            self.send(poll, token, &ToHelper::Release { id: t.id }, Vec::new());
+        }
+    }
+
+    /// Whether `key` has a texture (imported, or its import is out).
+    #[must_use]
+    pub fn has_tex(&self, key: BufferKey) -> bool {
+        self.texs.contains_key(&key)
     }
 
     /// The textures' buffer keys.

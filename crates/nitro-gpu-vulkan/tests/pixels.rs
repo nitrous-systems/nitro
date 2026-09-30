@@ -571,6 +571,58 @@ fn case7_errors_do_not_kill_the_helper() {
 
 /// `cargo test -p nitro-gpu-vulkan -- --ignored --nocapture footprint`
 #[test]
+fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
+    // #3962: a shot's composite. No ring: the target is made and freed
+    // inside the call.
+    let Some(mut h) = helper(&[]) else { return };
+    let (w, ht) = (100, 70);
+    let px = fill(40, 30, |_, _| bgra(20, 200, 40, 255));
+    h.shadow(1, 40, 30, XR24, &px);
+    let before = match h.call(&ToHelper::GetStats, vec![]).0 {
+        FromHelper::Stats(s) => s.drm_total,
+        other => panic!("{other:?}"),
+    };
+    let mut layers = vec![layer(1, 40, 30, IRect::new(0, 0, 50, 30), Blend::Opaque)];
+    let nv12 = h.nv12(2, 64, 64, (128, 100, 160)).is_some();
+    if nv12 {
+        layers.push(layer(2, 64, 64, IRect::new(50, 20, 32, 32), Blend::Opaque));
+    }
+    let img = match h.call(
+        &ToHelper::Capture {
+            serial: 5,
+            w,
+            h: ht,
+            layers,
+        },
+        vec![],
+    ) {
+        (FromHelper::Captured { serial: 5, w: cw, h: ch, stride }, mut fds) => {
+            assert_eq!((cw, ch), (w, ht));
+            let len = stride as usize * ch as usize;
+            let map = nitro_shm::Mapping::map(fds.pop().unwrap(), len).unwrap();
+            Image {
+                px: map.as_bytes().to_vec(),
+                w,
+                stride,
+            }
+        }
+        other => panic!("capture: {other:?}"),
+    };
+    img.assert_near(0, 0, [20, 200, 40], 0);
+    img.assert_near(49, 29, [20, 200, 40], 0);
+    if nv12 {
+        img.assert_near(60, 30, NV12_RGB, 3);
+        img.assert_near(81, 51, NV12_RGB, 3);
+    }
+    let after = match h.call(&ToHelper::GetStats, vec![]).0 {
+        FromHelper::Stats(s) => s.drm_total,
+        other => panic!("{other:?}"),
+    };
+    eprintln!("capture: drm_total {before} -> {after}");
+    assert!(after <= before, "the capture target was freed");
+}
+
+#[test]
 #[ignore = "measurement; run on a GPU box"]
 fn footprint() {
     let Some(mut h) = helper(&[]) else { return };

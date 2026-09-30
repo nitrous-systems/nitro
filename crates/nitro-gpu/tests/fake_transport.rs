@@ -206,6 +206,15 @@ fn every_message_round_trips() {
         (ToHelper::ReadBack { out_idx: 2 }, 0),
         (ToHelper::GetStats, 0),
         (ToHelper::Shutdown, 0),
+        (
+            ToHelper::Capture {
+                serial: 7,
+                w: 1920,
+                h: 1080,
+                layers: vec![layer(3, 64, 64)],
+            },
+            0,
+        ),
     ];
     for (m, n) in &to {
         round_trip(m, *n);
@@ -258,6 +267,15 @@ fn every_message_round_trips() {
         ),
         (FromHelper::Composited { serial: 5 }, 1),
         (FromHelper::Released { id: 3 }, 0),
+        (
+            FromHelper::Captured {
+                serial: 7,
+                w: 4,
+                h: 4,
+                stride: 16,
+            },
+            1,
+        ),
         (
             FromHelper::ReadBackReply {
                 out_idx: 0,
@@ -613,5 +631,86 @@ fn readback_and_upload_reach_the_backend() {
         fake.calls()
             .contains(&Call::Upload(1, vec![IRect::new(0, 0, 2, 2)]))
     );
+    shutdown(c, h);
+}
+
+#[test]
+fn capture_draws_the_layers_into_a_memfd_and_refuses_bad_ones() {
+    let fake = FakeBackend::auto_signal();
+    let (mut c, h) = start(fake.clone(), Config::default());
+    shadow(&mut c, 1, 4, 4);
+    let l = Layer {
+        tex: 1,
+        src: [0.0, 0.0, 4.0, 4.0],
+        dst: IRect::new(1, 1, 2, 2),
+        ..Layer::default()
+    };
+    // No ring needed.
+    let (r, fds) = c
+        .call(
+            &ToHelper::Capture {
+                serial: 9,
+                w: 4,
+                h: 4,
+                layers: vec![l],
+            },
+            vec![],
+            T,
+        )
+        .unwrap();
+    assert_eq!(
+        r,
+        FromHelper::Captured {
+            serial: 9,
+            w: 4,
+            h: 4,
+            stride: 16
+        }
+    );
+    let fd = fds.into_iter().next().unwrap();
+    let len = nitro_shm::sealed_len(&fd).unwrap();
+    assert_eq!(len, 64);
+    let m = nitro_shm::Mapping::map(fd, 64).unwrap();
+    let px = m.as_bytes();
+    assert_eq!(&px[(16 + 4)..(16 + 8)], &nitro_gpu::fake::CAPTURE_COLOR);
+    assert_eq!(&px[0..4], &[0, 0, 0, 0]);
+    assert!(fake.calls().contains(&Call::Capture(4, 4, vec![1])));
+
+    // An unknown texture, a dst outside the target, a backend failure:
+    // refused with the serial, and the helper carries on.
+    c.send(
+        &ToHelper::Capture {
+            serial: 10,
+            w: 4,
+            h: 4,
+            layers: vec![Layer { tex: 5, ..l }],
+        },
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::BadId);
+    c.send(
+        &ToHelper::Capture {
+            serial: 11,
+            w: 2,
+            h: 2,
+            layers: vec![l],
+        },
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::BadRect);
+    fake.state().fail_next_capture = true;
+    c.send(
+        &ToHelper::Capture {
+            serial: 12,
+            w: 4,
+            h: 4,
+            layers: vec![l],
+        },
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::Backend);
     shutdown(c, h);
 }

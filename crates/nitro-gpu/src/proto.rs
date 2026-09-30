@@ -24,9 +24,9 @@ use nitro_wire::{DecodeError, EncodeError, Frame, MAX_FDS, Reader, Writer};
 
 /// Protocol version; [`ToHelper::Hello`] and [`FromHelper::HelloReply`]
 /// carry it and a mismatch is refused.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
-/// Most layers in one [`Composite`].
+/// Most layers in one [`Composite`] or [`ToHelper::Capture`].
 pub const MAX_LAYERS: usize = 16;
 /// Most damage rects in one message.
 pub const MAX_RECTS: usize = 64;
@@ -373,6 +373,21 @@ pub enum ToHelper {
     GetStats,
     /// Exit cleanly (closing the socket does the same).
     Shutdown,
+    /// Draw `layers` (bottom first) into a **temporary** `w`×`h` target
+    /// and answer with its pixels (`Captured` + a sealed memfd), for a
+    /// screenshot (#3962). Blocks the helper until the GPU is done, like
+    /// `ReadBack`: never per frame. Pixels no layer covers are
+    /// undefined. Nothing it allocates outlives the reply.
+    Capture {
+        /// Server-chosen serial, echoed in `Captured` (and `Error.what`).
+        serial: u64,
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Layers, bottom first.
+        layers: Vec<Layer>,
+    },
 }
 
 /// Helper → server.
@@ -438,6 +453,18 @@ pub enum FromHelper {
     },
     /// Answer to `GetStats`.
     Stats(Stats),
+    /// Answer to `Capture`; a sealed memfd of `stride * h` bytes of
+    /// linear BGRX rides with it.
+    Captured {
+        /// The request's serial.
+        serial: u64,
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Row stride in bytes.
+        stride: u32,
+    },
 }
 
 /// Op codes.
@@ -462,6 +489,8 @@ pub mod op {
     pub const GET_STATS: u16 = 0x09;
     /// `Shutdown`.
     pub const SHUTDOWN: u16 = 0x0a;
+    /// `Capture`.
+    pub const CAPTURE: u16 = 0x0b;
 
     /// `HelloReply`.
     pub const HELLO_REPLY: u16 = 0x81;
@@ -479,6 +508,8 @@ pub mod op {
     pub const READ_BACK_REPLY: u16 = 0x87;
     /// `Stats`.
     pub const STATS: u16 = 0x88;
+    /// `Captured`.
+    pub const CAPTURED: u16 = 0x89;
 }
 
 /// A message of this protocol: encode with its fds, decode from a frame.
@@ -611,6 +642,36 @@ fn get_rects(r: &mut Reader<'_>) -> Result<Vec<IRect>, DecodeError> {
     (0..n).map(|_| get_rect(r)).collect()
 }
 
+fn put_layers(w: &mut Writer, layers: &[Layer]) {
+    w.put_u32(layers.len() as u32);
+    for l in layers {
+        w.put_u32(l.tex);
+        for v in l.src {
+            w.put_f32(v);
+        }
+        put_rect(w, l.dst);
+        w.put_u8(l.blend.to_u8());
+    }
+}
+
+fn get_layers(r: &mut Reader<'_>) -> Result<Vec<Layer>, DecodeError> {
+    let n = get_count(r, MAX_LAYERS, 37)?;
+    let mut layers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let tex = r.get_u32()?;
+        let src = [r.get_f32()?, r.get_f32()?, r.get_f32()?, r.get_f32()?];
+        let dst = get_rect(r)?;
+        let blend = Blend::from_u8(r.get_u8()?)?;
+        layers.push(Layer {
+            tex,
+            src,
+            dst,
+            blend,
+        });
+    }
+    Ok(layers)
+}
+
 fn put_formats(w: &mut Writer, f: &[FormatMod]) {
     w.put_u32(f.len() as u32);
     for f in f {
@@ -702,6 +763,7 @@ impl Message for ToHelper {
             Self::ReadBack { .. } => op::READ_BACK,
             Self::GetStats => op::GET_STATS,
             Self::Shutdown => op::SHUTDOWN,
+            Self::Capture { .. } => op::CAPTURE,
         }
     }
 
@@ -724,6 +786,7 @@ impl Message for ToHelper {
                     && c.layers.len() <= MAX_LAYERS
                     && c.fence_mask >> c.layers.len() == 0,
             ),
+            Self::Capture { layers, .. } => too_large(layers.len() <= MAX_LAYERS),
             _ => Ok(()),
         }
     }
@@ -777,19 +840,22 @@ impl Message for ToHelper {
                 w.put_u32(c.out_idx);
                 w.put_u32(c.fence_mask);
                 put_rects(w, &c.damage);
-                w.put_u32(c.layers.len() as u32);
-                for l in &c.layers {
-                    w.put_u32(l.tex);
-                    for v in l.src {
-                        w.put_f32(v);
-                    }
-                    put_rect(w, l.dst);
-                    w.put_u8(l.blend.to_u8());
-                }
+                put_layers(w, &c.layers);
             }
             Self::Release { id } => w.put_u32(*id),
             Self::ReadBack { out_idx } => w.put_u32(*out_idx),
             Self::GetStats | Self::Shutdown => {}
+            Self::Capture {
+                serial,
+                w: width,
+                h,
+                layers,
+            } => {
+                w.put_u64(*serial);
+                w.put_u32(*width);
+                w.put_u32(*h);
+                put_layers(w, layers);
+            }
         }
     }
 
@@ -857,21 +923,8 @@ impl Message for ToHelper {
                 let out_idx = r.get_u32()?;
                 let fence_mask = r.get_u32()?;
                 let damage = get_rects(r)?;
-                let n = get_count(r, MAX_LAYERS, 37)?;
-                let mut layers = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let tex = r.get_u32()?;
-                    let src = [r.get_f32()?, r.get_f32()?, r.get_f32()?, r.get_f32()?];
-                    let dst = get_rect(r)?;
-                    let blend = Blend::from_u8(r.get_u8()?)?;
-                    layers.push(Layer {
-                        tex,
-                        src,
-                        dst,
-                        blend,
-                    });
-                }
-                if fence_mask >> n != 0 {
+                let layers = get_layers(r)?;
+                if fence_mask >> layers.len() != 0 {
                     return Err(DecodeError::BadValue);
                 }
                 Self::Composite(Composite {
@@ -888,6 +941,12 @@ impl Message for ToHelper {
             },
             op::GET_STATS => Self::GetStats,
             op::SHUTDOWN => Self::Shutdown,
+            op::CAPTURE => Self::Capture {
+                serial: r.get_u64()?,
+                w: r.get_u32()?,
+                h: r.get_u32()?,
+                layers: get_layers(r)?,
+            },
             other => return Err(DecodeError::UnknownOp(other)),
         })
     }
@@ -904,13 +963,14 @@ impl Message for FromHelper {
             Self::Released { .. } => op::RELEASED,
             Self::ReadBackReply { .. } => op::READ_BACK_REPLY,
             Self::Stats(_) => op::STATS,
+            Self::Captured { .. } => op::CAPTURED,
         }
     }
 
     fn fd_count(&self) -> usize {
         match self {
             Self::OutputRing { slots, .. } => slots.len(),
-            Self::Composited { .. } | Self::ReadBackReply { .. } => 1,
+            Self::Composited { .. } | Self::ReadBackReply { .. } | Self::Captured { .. } => 1,
             _ => 0,
         }
     }
@@ -972,6 +1032,17 @@ impl Message for FromHelper {
                 stride,
             } => {
                 w.put_u32(*out_idx);
+                w.put_u32(*width);
+                w.put_u32(*h);
+                w.put_u32(*stride);
+            }
+            Self::Captured {
+                serial,
+                w: width,
+                h,
+                stride,
+            } => {
+                w.put_u64(*serial);
                 w.put_u32(*width);
                 w.put_u32(*h);
                 w.put_u32(*stride);
@@ -1040,6 +1111,12 @@ impl Message for FromHelper {
             },
             op::READ_BACK_REPLY => Self::ReadBackReply {
                 out_idx: r.get_u32()?,
+                w: r.get_u32()?,
+                h: r.get_u32()?,
+                stride: r.get_u32()?,
+            },
+            op::CAPTURED => Self::Captured {
+                serial: r.get_u64()?,
                 w: r.get_u32()?,
                 h: r.get_u32()?,
                 stride: r.get_u32()?,
