@@ -1688,7 +1688,12 @@ fn arm_wire(epoll: &OwnedFd, token: u64, client: &mut WireClient) {
     let Some(flags) = rearm_interest(client.out_armed, want) else {
         return;
     };
-    match epoll::modify(epoll, client.stream.as_fd(), EventData::new_u64(token), flags) {
+    match epoll::modify(
+        epoll,
+        client.stream.as_fd(),
+        EventData::new_u64(token),
+        flags,
+    ) {
         Ok(()) => client.out_armed = want,
         Err(e) => warn!("epoll_ctl mod wire client: {e}"),
     }
