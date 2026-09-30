@@ -87,7 +87,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
 - **Tab detach:** dragging a tab out of the strip does nothing. `NitroWindow` reports client-controlled window movement (the `PlatformWindow` default) but has no `WmMoveLoopHandler`, so the tab strip's move loop is cancelled at once. It is not a DnD path. Follow-up work.
-- **Drag and drop with native nitro apps:** nitro-ui is a drop target (#3966), so text and links dropped on nitro-term are pasted. It cannot be a drag source yet: #3967 (nitro-ui drag source, nitro-files).
+- **Drag and drop with native nitro apps:** nitro-ui is a drop target (#3966), so text and links dropped on nitro-term are pasted, and a drag source (#3967): files dragged out of nitro-files drop into pages and file inputs.
 - **Real hardware:** not tested on a real (non-fake) backend. All numbers are fake-backend.
 - **Raster time:** not measured on the Chromium side. The server-side paint/copy cost is below.
 - **Restore after minimize:** not exercised by the harness, which has no way to un-minimize.
@@ -130,7 +130,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
   - A source `FinishDrag` during the drag used to be ignored, so `CancelDrag` (for example a tab closed mid-drag) could not end a live grab. It now cancels: the target gets `DragLeave`, the grab ends, and no `DragFinished` follows. Tests: `data.rs::the_source_finishing_mid_drag_cancels_it`, `tests/dnd.rs::the_source_finishing_mid_drag_cancels_it`.
   - A drag `RequestSelection` racing a `DragLeave` already in flight was a fatal `Error { Protocol }`, which the target cannot avoid (the pointer crossing between windows quickly). From a client that has ever been sent a `DragEnter` it is now answered at EOF; from one that never was, it is still fatal. Test: `tests/dnd.rs::a_late_drag_read_ends_at_eof_and_a_strangers_is_fatal`.
 
-`just box=testhost2 chromium-dnd` (`deploy/chromium-dnd.sh`) tiles two browsers side by side, drives the drags through the control socket's `input` (press, motion steps, release), finds the pages by colour in a `shot`, and reads results back over DevTools. On testhost2 (2560×1440 at 1.25), 2026-09-30: after the last harness fix, 4 consecutive runs passed all 7 checks, and `chromium-clipboard` still passed 7/7. With #3966 (nitro-term as a drop target; the old reject check replaced by the text and link checks), 3 consecutive runs passed all 8 checks on 2026-09-30.
+`just box=testhost2 chromium-dnd` (`deploy/chromium-dnd.sh`) tiles two browsers side by side, drives the drags through the control socket's `input` (press, motion steps, release), finds the pages by colour in a `shot`, and reads results back over DevTools. On testhost2 (2560×1440 at 1.25), 2026-09-30: after the last harness fix, 4 consecutive runs passed all 7 checks, and `chromium-clipboard` still passed 7/7. With #3966 (nitro-term as a drop target; the old reject check replaced by the text and link checks), 3 consecutive runs passed all 8 checks on 2026-09-30. With #3967 (nitro-files as a drag source, five more checks), 3 consecutive runs passed all 13 checks on 2026-09-30 (2560×1440 at 1.25).
 
 | check | result |
 |---|---|
@@ -142,6 +142,11 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 | link A → nitro-term (#3966) | the URL is pasted (`text/uri-list`, kept verbatim); nitro-term alive |
 | Escape mid-drag over B | cancelled, `dragend` = none; A and B both take a click after |
 | A SIGKILLed mid-drag over B | B gets `DragLeave`, the server's grab is gone (`dnd_grab 0`), B takes a click |
+| file row nitro-files → B's drop zone (#3967) | `Files`, `files[0].name` = the file and its content read by the page; nitro-files says `dropped 1 item (copy)` |
+| file row → B's `<input type=file>` | the input's `files[0].name` is the file |
+| file row dropped on the bar | rejected; nitro-files alive, takes a click, no "dropped" |
+| Escape mid-drag from nitro-files over B | B stays `ready`; both take a click |
+| nitro-files SIGKILLed mid-drag over B | B gets `DragLeave`, `dnd_grab 0`, B takes a click |
 | tab dragged out of A's strip (INFO) | no DnD and no detach: see "What doesn't" (move loop) |
 
 The bar check carries the drag down into the page first and then straight up to the bar. A straight diagonal from the text to the bar crossed A's tab strip. About one run in three, the page then logged neither `dragstart` nor `dragend`, although the backend saw StartDrag → DragFinished{false} and nothing hung. The cause is not pinned down: it is Chromium-internal, below the platform, and the platform side ended cleanly each time.

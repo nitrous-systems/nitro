@@ -23,6 +23,16 @@
 #   escape              Escape mid-drag cancels; A and B still respond
 #   source-killed       A SIGKILLed mid-drag: B gets DragLeave, the grab
 #                       goes, B still takes a click
+#   files-to-page       a file row dragged from nitro-files (#3967) onto B's
+#                       drop zone: a File (Chromium turns the text/uri-list
+#                       into `Files`, the only type a page sees), its name
+#                       and content
+#   files-to-upload     the same row dropped on B's <input type=file>
+#   files-drop-on-nothing  dropped on the bar: rejected, nitro-files still
+#                       takes a click and does not say "dropped"
+#   files-escape        Escape mid-drag over B: B stays ready, both click
+#   files-killed        nitro-files SIGKILLed mid-drag over B: DragLeave,
+#                       no grab left, B still clicks
 #   tab-drag (INFO)     a tab dragged out of A's strip: reported only, the
 #                       move loop is not wired (docs/chromium.md)
 set -uo pipefail
@@ -123,7 +133,38 @@ def locate():
     else:
         out["term"] = None
     out["bar"] = (mid + mid // 2, 6)
+    up = box(lambda p: p == (0xdd, 0xdd, 0xff), 0, mid, step=4)
+    if up:
+        out["b_up"] = ((up[0] + up[2]) // 2, (up[1] + up[3]) // 2)
     return out
+
+def app_shot(app):
+    """An app's own `shot` over its introspection socket."""
+    d = os.environ["XDG_RUNTIME_DIR"] + "/nitro/apps"
+    sock = next(d + "/" + f for f in os.listdir(d) if f.startswith(app + "."))
+    s = socket.socket(socket.AF_UNIX); s.connect(sock); s.sendall(b"shot\n")
+    f = s.makefile("rb"); h = f.readline().split()
+    w, hh, st = int(h[1]), int(h[2]), int(h[3])
+    return w, hh, st, f.read(st * hh)
+
+def origin(app, lx, ly):
+    """Where (device px) the app's window is on the output: a stripe of
+    its own shot at (lx, ly) device px, found in the output's shot."""
+    w, h, st, d = app_shot(app)
+    ow, oh, ost, od = shot()
+    for dy in range(0, 40, 4):
+        y = ly + dy
+        stripe = d[y * st + 4 * lx: y * st + 4 * min(w, lx + 160)]
+        hits = []
+        for oy in range(oh):
+            row = od[oy * ost: oy * ost + 4 * ow]
+            i = row.find(stripe)
+            while i >= 0:
+                if i % 4 == 0: hits.append((i // 4 - lx, oy - y))
+                i = row.find(stripe, i + 1)
+            if len(hits) > 1: break
+        if len(hits) == 1: return hits[0]
+    return None
 
 if __name__ == "__main__":
     cmd = sys.argv[1]
@@ -131,6 +172,14 @@ if __name__ == "__main__":
     elif cmd == "locate":
         for k, v in locate().items():
             print("%s=%s" % (k, "" if v is None else "%d,%d" % v))
+    elif cmd == "row":
+        # row APP LX LY ROOT_W: logical point (LX, LY) in the app's window
+        # as output device px; the scale is its shot's width over ROOT_W.
+        w = app_shot(sys.argv[2])[0]
+        k = w / float(sys.argv[5])
+        dx, dy = int(int(sys.argv[3]) * k), int(int(sys.argv[4]) * k)
+        o = origin(sys.argv[2], dx, dy)
+        print("" if o is None else "%d,%d" % (o[0] + dx, o[1] + dy))
     elif cmd == "stat":
         for l in say("stats").splitlines():
             if l.split(" ")[0] == sys.argv[2]: print(l.split()[1])
@@ -165,8 +214,10 @@ body{margin:0;font:28px sans-serif}
 #src{position:absolute;left:30px;top:20px;background:#ffd}
 #lnk{position:absolute;left:30px;top:90px}
 #dz{position:absolute;left:0;top:260px;right:0;bottom:0;background:#dfd}
+#up{position:absolute;left:260px;top:20px;width:200px;height:200px;background:#ddf}
 </style></head><body>
 <span id=src>dragtext-4711</span><a id=lnk href="https://example.com/nitro-link-9">link-9</a>
+<input type=file id=up>
 <div id=dz>drop here</div>
 <script>
 const tag = location.hash.slice(1);
@@ -177,7 +228,11 @@ function sel() { const r = document.createRange(); r.selectNodeContents(src);
 dz.addEventListener('dragover', e => e.preventDefault());
 dz.addEventListener('drop', e => { e.preventDefault(); const d = e.dataTransfer;
   document.title = tag + '|drop|' + [...d.types].join(',') + '|' +
-    d.getData('text/plain').slice(0, 60) + '|uri=' + d.getData('text/uri-list').slice(0, 60); });
+    d.getData('text/plain').slice(0, 60) + '|uri=' + d.getData('text/uri-list').slice(0, 60) +
+    '|files=' + d.files.length + ':' + (d.files.length ? d.files[0].name : '');
+  if (d.files.length) d.files[0].text().then(t => document.title += '|content=' + t.trim()); });
+up.addEventListener('change', () => document.title = tag + '|up|' +
+  (up.files.length ? up.files[0].name : ''));
 addEventListener('dragstart', e => log.push('start'));
 addEventListener('dragend', e => log.push('end:' + e.dataTransfer.dropEffect));
 addEventListener('click', e => log.push('click'));
@@ -196,6 +251,7 @@ start_chrome() { # tag port [extra urls]
 cleanup() {
     kill "${pa:-}" "${pb:-}" 2>/dev/null
     [[ -n ${term_started:-} ]] && hey nitro-term quit >/dev/null 2>&1
+    [[ -n ${files_started:-} ]] && hey nitro-files quit >/dev/null 2>&1
     sleep 1
     pkill -9 -f -- "--user-data-dir=$work/prof" 2>/dev/null
     if [[ -n ${KEEP:-} ]]; then echo "kept $work"; else rm -rf "$work"; fi
@@ -292,7 +348,72 @@ leave=0; (( $(grep -c "nitro: DragLeave" "$work/b.log") > leaves )) && leave=1
 [[ $grab == 0 && $eb == click && $tb == b\|ready && $leave == 1 ]] && ok=1 || ok=0
 check source-killed $ok "grab=$grab B:$eb $tb leave=$leave"
 
-# 8. A tab dragged out of a strip (INFO): the move loop is not wired.
+# 8. nitro-files as the drag source (#3967), tiled over A's (now empty)
+# right half. Its rows are found from `hey` bounds plus the window's
+# origin, which `origin` finds by matching a stripe of its own shot.
+mkdir -p "$work/files" && echo "content-4711" > "$work/files/dnd-file-4711.txt"
+hey nitro-files >/dev/null 2>&1 && hey nitro-files quit >/dev/null 2>&1
+sleep 0.5; setsid nitro-files >/dev/null 2>&1 < /dev/null & files_started=1
+sleep 2; chord 106
+hey nitro-files set path value "$work/files" >/dev/null; hey nitro-files do path submit >/dev/null
+sleep 1
+eval "$(L locate | grep '^b_up=')"
+files_row() { # device px of row 0's middle, or empty
+    local b r; b=$(hey nitro-files get list bounds 2>/dev/null) || return
+    r=$(hey nitro-files get / bounds 2>/dev/null) || return
+    local lx=${b%%,*} rest=${b#*,}; local ly=${rest%%,*}
+    local rw=${r#*,*,}; rw=${rw%%,*}
+    L row nitro-files $((lx + 30)) $((ly + 14)) "$rw"
+}
+fstatus() { hey nitro-files get status value 2>/dev/null; }
+row=$(files_row)
+echo "  nitro-files row0=$row  B up=${b_up:-}"
+if [[ -n $row && -n ${b_up:-} ]]; then
+    reset 9502
+    drag "$row" "$b_dz"; sleep 1
+    t=$(L js 9502 document.title)
+    [[ $t == *'|drop|Files|'*'|files=1:dnd-file-4711.txt'*'|content=content-4711'* ]] && ok=1 || ok=0
+    check files-to-page $ok "$t  status=$(fstatus)"
+
+    reset 9502
+    drag "$row" "$b_up"; sleep 1
+    t=$(L js 9502 document.title)
+    [[ $t == *'|up|dnd-file-4711.txt' ]] && ok=1 || ok=0
+    check files-to-upload $ok "$t"
+
+    drag "$row" "$bar"
+    alive=0; pgrep -x nitro-files >/dev/null && alive=1
+    click "$row"; st=$(fstatus)
+    [[ $alive == 1 && $st != *dropped* && $st == *'1 selected'* && $(L stat dnd_grab) == 0 ]] && ok=1 || ok=0
+    check files-drop-on-nothing $ok "alive=$alive status=$st"
+
+    reset 9502
+    drag "$row" "$b_dz" 0
+    S input key 1 tap; sleep 0.5; S input button left up; sleep 1
+    click "$b_dz"; click "$row"
+    eb=$(L js 9502 'log.join()'); tb=$(L js 9502 document.title); st=$(fstatus)
+    [[ $eb == click && $tb == b\|ready && $st == *'1 selected'* && $st != *dropped* ]] && ok=1 || ok=0
+    check files-escape $ok "B:$eb $tb status=$st"
+
+    reset 9502
+    leaves=$(grep -c "nitro: DragLeave" "$work/b.log")
+    drag "$row" "$b_dz" 0
+    pkill -9 -x nitro-files; files_started=; sleep 1.5
+    grab=$(L stat dnd_grab)
+    S input button left up; sleep 0.5
+    click "$b_dz"
+    eb=$(L js 9502 'log.join()'); tb=$(L js 9502 document.title)
+    leave=0; (( $(grep -c "nitro: DragLeave" "$work/b.log") > leaves )) && leave=1
+    [[ $grab == 0 && $eb == click && $tb == b\|ready && $leave == 1 ]] && ok=1 || ok=0
+    check files-killed $ok "grab=$grab B:$eb $tb leave=$leave"
+else
+    for c in files-to-page files-to-upload files-drop-on-nothing files-escape files-killed; do
+        check $c 0 "nitro-files row or B's file input not found"
+    done
+fi
+hey nitro-files quit >/dev/null 2>&1; files_started=
+
+# 9. A tab dragged out of a strip (INFO): the move loop is not wired.
 pa=$(start_chrome a 9501 "file://$work/dnd.html#a2"); sleep 7
 pages() { curl -s "http://127.0.0.1:$1/json" | python3 -c 'import json,sys; print(sum(t["type"]=="page" for t in json.load(sys.stdin)))'; }
 before=$(grep -c "nitro: StartDrag" "$work/a.log")

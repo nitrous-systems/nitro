@@ -833,6 +833,7 @@ itself, so a symlink to a directory is unlinked and its target untouched.
 | `F2` | rename the cursor's row |
 | `Delete` | move the selection to the trash, after a confirm |
 | `Shift+Delete` | delete the selection permanently, after a confirm |
+| drag a row | drag the selection out as files (§ Drag and drop) |
 | `Ctrl+N` | new folder |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut paths to the system clipboard / paste files from it here (a cut paste moves) |
 | `Ctrl+H` | show hidden files |
@@ -1306,17 +1307,44 @@ in `docs/testbox.md`:
   absent reported "still up" three times while the app was in fact gone.
   `pgrep -x` on the binary name.
 
+## Drag and drop
+
+Rows are a drag source (#3967, through `List::on_drag` and
+`Ui::start_drag`, `docs/ui.md` § Drag and drop (source)). Press on a row
+and move 6 px: the selection is dragged. A press on a row that is part of
+a multi-selection drags all of it (a click there still collapses it on
+the release).
+
+* **What is offered** is what `Ctrl+C` offers, minus the GNOME/KDE cut
+  forms: `text/uri-list` (`file://` URIs, CRLF), `text/plain;charset=utf-8`
+  and `text/plain` (the paths, `\n`-joined). A page in Chromium sees a
+  `File` it can read; an `<input type=file>` takes it; nitro-term pastes
+  the URI.
+* **Actions:** `COPY | LINK`, plus `MOVE` only when the user could move
+  every dragged entry from here: its directory is writable
+  (`access(W_OK)`), it is not in the trash, and it is not a sidebar place.
+* **The source never deletes.** For `file://` URIs the *target* performs a
+  move (the XDND and Wayland file-manager convention). A target that
+  claims `MOVE` but only copied (an upload, say) would lose the file if the
+  source deleted on `DragFinished { Move }`. So on a move this side only
+  re-lists, and says `dropped N items (move)` if the files are gone, else
+  `(copy)`.
+* **Icon:** a small panel with the file's icon and name, or `N items`, just
+  below-right of the pointer. The status line says `dragging N items`
+  during the drag, `dropped N items (copy|move|link)` after an accepted
+  drop, and returns to the counts otherwise.
+* Without `DATA` (a remote link) nothing starts; the press is a click.
+* Not a drop target yet: see Limitations.
+
 ## Limitations
 
 Each of these is a real feature rather than a missing case, and each is
 recorded because the spec asks for them rather than because they are
 regrets.
 
-* **No drag and drop.** There is no drag protocol on the wire, and a
-  drag between two clients is a server-side concept — a source, a target,
-  a negotiated type and a cursor that follows the pointer across window
-  boundaries. Copy and paste are the keyboard path to the same result
-  within this app.
+* **Not a drop target.** Rows can be dragged out (§ Drag and drop), but
+  nothing can be dropped into the file manager yet; paste (`Ctrl+V`) is
+  the way in.
 * **The clipboard carries paths, not file contents.**
   * `Ctrl+C` (copy) and `Ctrl+X` (cut) offer the selected paths on the
     system clipboard, in this order:

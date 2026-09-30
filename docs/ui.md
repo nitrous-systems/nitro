@@ -334,7 +334,7 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step; `.vertical()` runs it bottom-to-top (a fader, an equaliser band), with Up still raising it |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel (`speed` px a notch, default 40; touchpad 1:1), arrows, PgUp/PgDn, Home/End |
-| `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds; a row's icon is a **name** |
+| `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds; a row's icon is a **name**; `on_drag` makes rows a drag source |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
 | `Icon` | `icon` | the icon **name** | `set_icon`, `set_value` | named, never drawn: the server owns the artwork (`docs/icons.md`) |
@@ -986,7 +986,7 @@ positions already **widget-local**:
   ends the capture reconciles hover against what is really under the
   pointer (leaves and enters, no move). `EventCx::is_captured` tells a
   widget whether a `PointerLeave` is a slide-off (keep the drag) or the
-  server taking the pointer away — a window drag or DnD the app began, a
+  server taking the pointer away — a window drag or a DnD the app began (`Ui::start_drag`), a
   lock, overview, the window closing — after which the release never
   comes (drop it). A widget removed mid-capture cuts the captured chain
   at itself; its ancestors keep the capture. `Slider` drags, `TextField`
@@ -1311,8 +1311,56 @@ target changes nothing:
   the state is forgotten. After `DragDrop` the server sends no
   `DragLeave`, so the end of the drop does the reset itself.
 
-There is no drag-source API yet: a widget cannot start a drag (#3967).
 `nitro-term` is the first target (`docs/term.md` § Limitations).
+
+### Drag and drop (source)
+
+The same module starts drags (#3967). The API is on `Ui`:
+
+| call | what |
+|---|---|
+| `start_drag(from, DragSource, on_finished) -> Result<bool>` | offer `items` (`(mime, bytes)`, most preferred first) with `actions` (a `drag_actions` mask) and an optional `DragIcon`; `on_finished(state, ui, DragOutcome { accepted, action })` runs once, deferred |
+| `can_drag()` | the server has `DATA` and no drag of ours is in flight |
+| `drag_in_flight()` | a drag we started has not finished yet |
+| `DRAG_THRESHOLD` | 6 logical px: how far a press must travel before it is a drag |
+
+* **When.** Call it from a `PointerMove` while the widget holds the
+  pointer capture, once the pointer is `DRAG_THRESHOLD` from the press.
+  `start_drag` answers `Ok(false)` and sends nothing without `DATA` (a
+  remote link, an old server), while a drag is in flight, with nothing
+  (valid) offered, or when `from` holds no capture: the server only takes
+  a `StartDrag` while a button is down on the window.
+* **`List::on_drag(|s, ui, &[usize]|)`** (and `set_on_drag`) does the
+  press/threshold part for a list: a plain press on a row, moved past the
+  threshold under capture, calls it with the selected indices, once per
+  press. With it set, a plain press on a row already in a multi-selection
+  keeps the selection (so all of it can be dragged) and collapses it to
+  that row on the release if no drag started. Ctrl- and Shift-clicks never
+  arm a drag. Without `on_drag` the list behaves exactly as before.
+* **One commit.** The icon (`DragIcon { root, size, offset }`) is a widget
+  tree in its own `UNDECORATED | NO_FOCUS` window. Its `CreateWindow`,
+  first paint, `SetDragIconOffset` and the `StartDrag` are buffered into
+  the same commit, which the loop flushes in the same turn, while the
+  button is still down.
+* **Capture loss.** When the server takes the drag, the window gets
+  `PointerLeave` and never the release. The capture is dropped before the
+  leaves go out, so the pressed widget sees `PointerLeave` with
+  `is_captured() == false` (see Pointer capture above).
+* **Serving.** `SelectionRequest { source: Drag }` is answered from the
+  offered bytes in a sealed memfd, as the clipboard serves; an unknown
+  type, or any request after the drag ended, gets an empty memfd (EOF).
+* **The end.** `DragFinished` is answered with `FinishDrag` at once; the
+  icon window is destroyed, the bytes are forgotten, and `on_finished`
+  runs. A drop on nothing, Escape and a rejecting target all end as
+  `accepted: false, action: None`.
+* **A refused start still ends.** The server ignores a `StartDrag`
+  silently (the button came up first, no pointer focus, another drag
+  running). The release that then reaches `from` while our drag was never
+  taken ends it locally as rejected, so an app never waits for ever.
+* The server handles the source disconnecting mid-drag (the target gets
+  `DragLeave`); nothing is needed here.
+
+`nitro-files` is the first source (`docs/files.md` § Drag and drop).
 
 
 ### Resizes, for an app whose content has its own units
