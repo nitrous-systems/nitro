@@ -33,6 +33,7 @@ use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use nitro_files::uri::ClipOp;
 use nitro_files::{Confirm, Editing, Files, Ids, dir, mime, names, trash};
 use nitro_ui::event::key;
 use nitro_ui::split::SidebarRow;
@@ -903,11 +904,12 @@ fn a_pending_confirm_swallows_the_ctrl_shortcuts() {
         "the question is still the same question"
     );
 
-    // The other four, for the same reason and in one sweep: none may act,
+    // The other five, for the same reason and in one sweep: none may act,
     // and none may move the focus. Ctrl+H would toggle hidden files, Ctrl+S
-    // would re-sort, Ctrl+C would copy the selection, Ctrl+V would paste.
+    // would re-sort, Ctrl+C would copy the selection, Ctrl+X would cut it,
+    // Ctrl+V would paste.
     let hidden = h.state().shows_hidden();
-    for k in [key::H, key::S, key::C, key::V] {
+    for k in [key::H, key::S, key::C, key::X, key::V] {
         h.key_with(key::LEFT_CTRL, k);
         h.settle();
         assert_eq!(h.ui().focused(), None, "a shortcut gave the keyboard away");
@@ -1187,6 +1189,101 @@ fn ctrl_c_then_ctrl_v_copies_the_file_into_the_new_directory() {
     );
     assert_eq!(names_of(&h, ids), ["note.txt"], "and the list refreshed");
     assert!(status(&h, ids).contains("copied 1 item"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn ctrl_x_then_ctrl_v_moves_the_file_into_the_new_directory() {
+    let (root, dir) = fixture("cut");
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).expect("a subdirectory");
+    write(&dir.join("note.txt"), "move me");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(names_of(&h, ids), ["sub", "note.txt"]);
+
+    h.key(key::DOWN);
+    h.settle();
+    h.key_with(key::LEFT_CTRL, key::X);
+    h.settle();
+    assert_eq!(h.state().clipboard(), [dir.join("note.txt")]);
+    assert_eq!(h.state().clipboard_op(), ClipOp::Cut);
+    assert!(status(&h, ids).contains("cut note.txt"));
+    assert!(dir.join("note.txt").exists(), "a cut moves nothing yet");
+
+    h.key(key::HOME);
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().cwd(), sub);
+    h.key_with(key::LEFT_CTRL, key::V);
+    h.settle();
+
+    assert_eq!(
+        std::fs::read_to_string(sub.join("note.txt")).expect("the moved file"),
+        "move me"
+    );
+    assert!(!dir.join("note.txt").exists(), "a cut paste is a move");
+    assert_eq!(names_of(&h, ids), ["note.txt"]);
+    assert!(status(&h, ids).contains("moved 1 item"));
+    assert!(
+        h.state().clipboard().is_empty(),
+        "the clipboard is emptied once a cut is pasted"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn ctrl_x_then_ctrl_v_in_the_same_directory_is_a_no_op() {
+    let (root, dir) = fixture("cut-here");
+    write(&dir.join("note.txt"), "stay");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    h.key_with(key::LEFT_CTRL, key::X);
+    h.settle();
+    h.key_with(key::LEFT_CTRL, key::V);
+    h.settle();
+    assert_eq!(names_of(&h, ids), ["note.txt"], "no `note copy.txt`");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+        "stay"
+    );
+    assert!(status(&h, ids).contains("already here"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_cut_paste_over_an_existing_name_takes_a_copy_name() {
+    let (root, dir) = fixture("cut-collide");
+    let sub = dir.join("sub");
+    write(&sub.join("note.txt"), "already there");
+    write(&dir.join("note.txt"), "incoming");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(names_of(&h, ids), ["sub", "note.txt"]);
+    h.key(key::DOWN);
+    h.settle();
+    h.key_with(key::LEFT_CTRL, key::X);
+    h.settle();
+    h.key(key::HOME);
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().cwd(), sub);
+    h.key_with(key::LEFT_CTRL, key::V);
+    h.settle();
+    assert_eq!(
+        std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+        "already there",
+        "not overwritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sub.join("note copy.txt")).unwrap(),
+        "incoming"
+    );
+    assert!(!dir.join("note.txt").exists());
+    assert!(status(&h, ids).contains("moved 1 item"));
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
@@ -1878,6 +1975,55 @@ fn ctrl_c_offers_the_paths_as_a_uri_list_and_text() {
         peer.paste(&mut h, 2, "text/plain;charset=utf-8"),
         path.to_str().unwrap().as_bytes()
     );
+    let uri = format!("file://{}", path.display()).replace(' ', "%20");
+    assert_eq!(
+        String::from_utf8(peer.paste(&mut h, 3, "x-special/gnome-copied-files")).unwrap(),
+        format!("copy\n{uri}")
+    );
+
+    // A cut says so in the GNOME form, and with KDE's marker.
+    h.key_with(key::LEFT_CTRL, key::X);
+    h.settle();
+    assert_eq!(
+        String::from_utf8(peer.paste(&mut h, 4, "x-special/gnome-copied-files")).unwrap(),
+        format!("cut\n{uri}")
+    );
+    assert_eq!(
+        peer.paste(&mut h, 5, "application/x-kde-cutselection"),
+        b"1"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn ctrl_v_moves_files_a_peer_cut_as_gnome_copied_files() {
+    let (root, dir) = fixture("gnome-in");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let src = elsewhere.join("from away.txt");
+    write(&src, "moved");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert!(names_of(&h, ids).is_empty());
+    let mut peer = ClipboardPeer::new(&h, "peer");
+    peer.copy(&mut h, &["x-special/gnome-copied-files", "text/uri-list"]);
+    h.key_with(key::LEFT_CTRL, key::V);
+    let (id, mime) = peer.asked(&mut h);
+    assert_eq!(
+        mime, "x-special/gnome-copied-files",
+        "the form that says cut"
+    );
+    let body = format!("cut\n{}", nitro_files::uri::path_to_file_uri(&src));
+    peer.answer_bytes(id, body.as_bytes());
+    h.wait_for("the paste", |_| dir.join("from away.txt").exists());
+    h.settle();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("from away.txt")).unwrap(),
+        "moved"
+    );
+    assert!(!src.exists(), "a peer's cut pastes as a move");
+    assert_eq!(names_of(&h, ids), ["from away.txt"]);
+    assert!(status(&h, ids).contains("moved 1 item"));
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }

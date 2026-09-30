@@ -232,12 +232,17 @@ pub struct Files {
     confirm: Option<Confirm>,
     /// The inline edit in progress.
     editing: Editing,
-    /// Paths copied with `Ctrl+C`, pasted with `Ctrl+V`.
+    /// Paths copied with `Ctrl+C` or cut with `Ctrl+X`, pasted with
+    /// `Ctrl+V`.
     ///
-    /// Also offered on the system clipboard as `text/uri-list` and
-    /// text; this copy is what a paste falls back to when the system
-    /// clipboard has no uri-list (a remote link, an old server).
+    /// Also offered on the system clipboard as
+    /// `x-special/gnome-copied-files`, `text/uri-list` and text; this copy
+    /// is what a paste falls back to when the system clipboard has no
+    /// file list (a remote link, an old server).
     clipboard: Vec<PathBuf>,
+    /// Whether [`Files::clipboard`] was copied or cut: a cut pastes as a
+    /// move, and is emptied once pasted.
+    clip_op: uri::ClipOp,
     /// The system MIME glob table, loaded once at start.
     ///
     /// Shared rather than owned: a background [`dir::Scan`] resolves the
@@ -284,6 +289,7 @@ impl Files {
             confirm: None,
             editing: Editing::None,
             clipboard: Vec::new(),
+            clip_op: uri::ClipOp::Copy,
             globs: mime::load_globs2(Path::new("/usr/share/mime/globs2")).into(),
             assoc: mime::Assoc::from_env(),
             trash: trash::Trash::from_env(),
@@ -417,10 +423,16 @@ impl Files {
         &self.editing
     }
 
-    /// The paths `Ctrl+C` remembered.
+    /// The paths `Ctrl+C` or `Ctrl+X` remembered.
     #[must_use]
     pub fn clipboard(&self) -> &[PathBuf] {
         &self.clipboard
+    }
+
+    /// Whether [`Files::clipboard`] was copied or cut.
+    #[must_use]
+    pub fn clipboard_op(&self) -> uri::ClipOp {
+        self.clip_op
     }
 
     /// How many directories have been listed.
@@ -903,7 +915,17 @@ fn install(ui: &mut Ui<Files>) {
             if s.confirm.is_some() {
                 return;
             }
-            copy_selection(s, ui);
+            offer_selection(s, ui, uri::ClipOp::Copy);
+        },
+    );
+    ui.set_shortcut(
+        mods::CTRL,
+        key::X,
+        move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
+            offer_selection(s, ui, uri::ClipOp::Cut);
         },
     );
     ui.set_shortcut(
@@ -1527,70 +1549,121 @@ fn commit_edit(s: &mut Files, ui: &mut Ui<Files>, text: &str) {
 
 // -- copy and paste ---------------------------------------------------
 
-/// Remember the selection for a later paste, and offer it on the system
-/// clipboard as `text/uri-list` plus the paths as text.
-fn copy_selection(s: &mut Files, ui: &mut Ui<Files>) {
+/// Remember the selection for a later paste (a move, for a cut), and
+/// offer it on the system clipboard as `x-special/gnome-copied-files`,
+/// `text/uri-list` and the paths as text — plus KDE's cut marker for a
+/// cut, so a paste in Dolphin moves too.
+fn offer_selection(s: &mut Files, ui: &mut Ui<Files>, op: uri::ClipOp) {
     let paths = selected_paths(s, ui);
     if paths.is_empty() {
         return;
     }
+    let gnome = uri::gnome_copied_files(op, &paths).into_bytes();
     let list = uri::uri_list(&paths).into_bytes();
     let text = uri::plain_list(&paths);
-    let offered = ui.set_clipboard(vec![
+    let mut items = vec![
+        (uri::GNOME_COPIED_FILES_MIME.to_owned(), gnome),
         (URI_LIST_MIME.to_owned(), list),
         (TEXT_MIME.to_owned(), text.clone()),
         (PLAIN_MIME.to_owned(), text),
-    ]);
+    ];
+    if op == uri::ClipOp::Cut {
+        items.push((uri::KDE_CUT_MIME.to_owned(), b"1".to_vec()));
+    }
+    let offered = ui.set_clipboard(items);
+    let verb = match op {
+        uri::ClipOp::Copy => "copied",
+        uri::ClipOp::Cut => "cut",
+    };
     s.message = Some(match (offered, paths.len()) {
-        (Ok(false), _) => "copied, but not to the system clipboard (no keyboard focus)".to_owned(),
-        (Err(e), _) => format!("copied, but not to the system clipboard: {e}"),
-        (Ok(true), 1) => format!("copied {}", short(&paths[0])),
-        (Ok(true), n) => format!("copied {n} items"),
+        (Ok(false), _) => {
+            format!("{verb}, but not to the system clipboard (no keyboard focus)")
+        }
+        (Err(e), _) => format!("{verb}, but not to the system clipboard: {e}"),
+        (Ok(true), 1) => format!("{verb} {}", short(&paths[0])),
+        (Ok(true), n) => format!("{verb} {n} items"),
     });
     s.clipboard = paths;
+    s.clip_op = op;
     show_status(s, ui);
 }
 
-/// Paste into the current directory: the system clipboard's
-/// `text/uri-list` when it offers one, else what `Ctrl+C` remembered.
+/// Paste into the current directory: the system clipboard's file list
+/// when it offers one (`x-special/gnome-copied-files` first, since it
+/// says copy or cut; else `text/uri-list`, always a copy), else what
+/// `Ctrl+C`/`Ctrl+X` remembered.
 fn paste(s: &mut Files, ui: &mut Ui<Files>) {
-    if ui.clipboard_mimes().iter().any(|m| m == URI_LIST_MIME) {
+    let offered = ui
+        .clipboard_mimes()
+        .iter()
+        .any(|m| m == uri::GNOME_COPIED_FILES_MIME || m == URI_LIST_MIME);
+    if offered {
         let into = s.cwd.clone();
-        ui.read_clipboard(&[URI_LIST_MIME], move |s: &mut Files, ui, got| {
-            if s.confirm.is_some() {
-                return;
-            }
-            let paths = got
-                .map(|(_, b)| uri::parse_uri_list(&String::from_utf8_lossy(&b)))
-                .unwrap_or_default();
-            paste_paths(s, ui, &paths, &into);
-        });
+        ui.read_clipboard(
+            &[uri::GNOME_COPIED_FILES_MIME, URI_LIST_MIME],
+            move |s: &mut Files, ui, got| {
+                if s.confirm.is_some() {
+                    return;
+                }
+                let (op, paths) = match got {
+                    Some((mime, b)) if mime == uri::GNOME_COPIED_FILES_MIME => {
+                        uri::parse_gnome_copied_files(&String::from_utf8_lossy(&b))
+                    }
+                    Some((_, b)) => (
+                        uri::ClipOp::Copy,
+                        uri::parse_uri_list(&String::from_utf8_lossy(&b)),
+                    ),
+                    None => (uri::ClipOp::Copy, Vec::new()),
+                };
+                paste_paths(s, ui, op, &paths, &into);
+            },
+        );
         return;
     }
     let paths = s.clipboard.clone();
     let into = s.cwd.clone();
-    paste_paths(s, ui, &paths, &into);
+    paste_paths(s, ui, s.clip_op, &paths, &into);
 }
 
-/// Copy each of `paths` into `into`, then say how it went and relist.
-fn paste_paths(s: &mut Files, ui: &mut Ui<Files>, paths: &[PathBuf], into: &Path) {
+/// Copy (or, for a cut, move) each of `paths` into `into`, then say how
+/// it went and relist.
+///
+/// After a cut paste that moved something, the clipboard — ours and the
+/// system's — is emptied, as Nautilus does: the sources are gone, so a
+/// second paste could only fail.
+fn paste_paths(s: &mut Files, ui: &mut Ui<Files>, op: uri::ClipOp, paths: &[PathBuf], into: &Path) {
     if paths.is_empty() {
         s.message = Some("nothing to paste".to_owned());
         show_status(s, ui);
         return;
     }
-    let (mut done, mut failure) = (0usize, None);
+    let (mut done, mut here, mut failure) = (0usize, 0usize, None);
     for src in paths {
-        match ops::copy_into(src, into) {
-            Ok(_) => done += 1,
+        let result = match op {
+            uri::ClipOp::Copy => ops::copy_into(src, into).map(Some),
+            uri::ClipOp::Cut => ops::move_into(src, into),
+        };
+        match result {
+            Ok(Some(_)) => done += 1,
+            Ok(None) => here += 1,
             Err(e) => failure = Some(format!("{}: {e}", short(src))),
         }
     }
+    let verb = match op {
+        uri::ClipOp::Copy => "copied",
+        uri::ClipOp::Cut => "moved",
+    };
     s.message = Some(match failure {
         Some(e) => e,
-        None if done == 1 => "copied 1 item".to_owned(),
-        None => format!("copied {done} items"),
+        None if done == 0 && here > 0 => "already here".to_owned(),
+        None if done == 1 => format!("{verb} 1 item"),
+        None => format!("{verb} {done} items"),
     });
+    if op == uri::ClipOp::Cut && done > 0 {
+        s.clipboard.clear();
+        s.clip_op = uri::ClipOp::Copy;
+        let _ = ui.set_clipboard(Vec::new());
+    }
     relist(s, ui);
 }
 

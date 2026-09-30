@@ -1,16 +1,17 @@
 //! The operations a file manager does to files: rename, new folder,
-//! copy.
+//! copy, move.
 //!
-//! Three functions and an error type, and most of the thinking is in the
+//! Four functions and an error type, and most of the thinking is in the
 //! error type: these run from a status bar with no modal dialogs, so
 //! every way they can fail has to be a value with a short sentence in it
 //! rather than a panic, an `unwrap`, or a silence.
 //!
-//! What is *not* here is move and delete. Deleting is
-//! [`crate::trash::Trash::send`], because a file manager that deleted
-//! rather than trashed would be one mis-keypress from a bad day; moving
-//! is a `rename` the app can do directly, and a cross-filesystem move
-//! has the copy-then-delete problem the trash module argues about.
+//! What is *not* here is delete: that is [`crate::trash::Trash::send`],
+//! because a file manager that deleted rather than trashed would be one
+//! mis-keypress from a bad day. Moving ([`move_into`], a cut-and-paste)
+//! is a `rename` when it can be, and across filesystems a copy followed
+//! by a delete of the source — only once the copy has completed, so a
+//! failure half way leaves the original where it was.
 
 use std::path::{Path, PathBuf};
 
@@ -78,9 +79,8 @@ impl From<std::io::Error> for Error {
 /// overwrite: `rename(2)` would replace it, and losing a file to a typo
 /// in a rename box is not recoverable. (The check is a `try_exists`
 /// before the `rename`, so it races a second process creating the target
-/// in between; the alternative is `renameat2(RENAME_NOREPLACE)`, which is
-/// Linux-only and not exposed by the rustix feature set this crate
-/// takes. The race needs two programs writing the same directory in the
+/// in between; [`move_into`] closes it with `renameat2(RENAME_NOREPLACE)`,
+/// which a rename box could use too but does not need to. The race needs two programs writing the same directory in the
 /// same millisecond, and the window is not new — every file manager has
 /// it.)
 ///
@@ -186,6 +186,96 @@ pub fn copy_into(src: &Path, dst_dir: &Path) -> Result<PathBuf, Error> {
     let target = free_name(dst_dir, &name)?;
     copy_tree(src, &target, 0)?;
     Ok(target)
+}
+
+/// Move `src` into the directory `dst_dir`, choosing a name that is free.
+///
+/// The paste half of a cut. `Ok(None)` when `src` is already in
+/// `dst_dir`: cutting a file and pasting it where it is means "leave it",
+/// not "make a `foo copy`". A name collision picks the same `foo copy`
+/// name as [`copy_into`] rather than replacing what is there.
+///
+/// The rename is `renameat2(RENAME_NOREPLACE)`, so a file that appears
+/// under the chosen name between the check and the rename is never
+/// clobbered (a fresh name is picked instead). Across filesystems
+/// (`EXDEV`) the move is a [`copy_into`]-style copy of the tree followed
+/// by removal of the source — and the source is removed **only** if the
+/// copy finished; a failed copy has its partial target removed and the
+/// original left alone.
+///
+/// # Errors
+/// [`Error::IntoSelf`] for a directory into its own subtree,
+/// [`Error::Exists`] when no free name could be found, [`Error::Io`] for
+/// the rename, the copy or the removal.
+pub fn move_into(src: &Path, dst_dir: &Path) -> Result<Option<PathBuf>, Error> {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| Error::BadName(src.to_string_lossy().into_owned()))?;
+    if src.parent() == Some(dst_dir) {
+        return Ok(None);
+    }
+    if dst_dir == src || dst_dir.starts_with(src) {
+        return Err(Error::IntoSelf);
+    }
+    let mut attempts = 0;
+    loop {
+        let target = free_name(dst_dir, &name)?;
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            src,
+            rustix::fs::CWD,
+            &target,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return Ok(Some(target)),
+            // Someone took the name since `free_name` looked: look again.
+            Err(rustix::io::Errno::EXIST) if attempts < 3 => attempts += 1,
+            Err(rustix::io::Errno::XDEV) => {
+                move_by_copy(src, &target)?;
+                return Ok(Some(target));
+            }
+            // A filesystem or kernel without `RENAME_NOREPLACE`: the
+            // `free_name` check is all the protection there is, as for
+            // [`rename`].
+            Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
+                match std::fs::rename(src, &target) {
+                    Ok(()) => return Ok(Some(target)),
+                    Err(e) if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
+                        move_by_copy(src, &target)?;
+                        return Ok(Some(target));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(Error::Io(e.into())),
+        }
+    }
+}
+
+/// The cross-filesystem move: copy `src` to `target`, and only if that
+/// completed, remove `src`.
+///
+/// A failed copy removes its partial `target` (best effort) and leaves
+/// `src` untouched. The removal looks at the link itself
+/// (`symlink_metadata`), so a symlink to a directory is unlinked, never
+/// recursed into.
+fn move_by_copy(src: &Path, target: &Path) -> Result<(), Error> {
+    if let Err(e) = copy_tree(src, target, 0) {
+        let _ = if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+            std::fs::remove_dir_all(target)
+        } else {
+            std::fs::remove_file(target)
+        };
+        return Err(e);
+    }
+    let md = std::fs::symlink_metadata(src)?;
+    if md.is_dir() {
+        std::fs::remove_dir_all(src)?;
+    } else {
+        std::fs::remove_file(src)?;
+    }
+    Ok(())
 }
 
 /// How deep a recursive copy will go.
@@ -477,6 +567,119 @@ mod tests {
         let dir = scratch("copy-missing");
         let err = copy_into(&dir.join("ghost"), &dir).expect_err("an error");
         assert!(matches!(err, Error::Io(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_into_another_directory_renames_the_file() {
+        let dir = scratch("move");
+        let other = dir.join("other");
+        std::fs::create_dir(&other).expect("mkdir");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"body").expect("write");
+        let landed = move_into(&file, &other).expect("move");
+        assert_eq!(landed, Some(other.join("notes.txt")));
+        assert!(!file.exists(), "a move, not a copy");
+        assert_eq!(read(&other.join("notes.txt")), "body");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_onto_an_existing_name_takes_a_copy_name() {
+        let dir = scratch("move-collide");
+        let other = dir.join("other");
+        std::fs::create_dir(&other).expect("mkdir");
+        std::fs::write(other.join("x.txt"), b"old").expect("write");
+        let file = dir.join("x.txt");
+        std::fs::write(&file, b"new").expect("write");
+        let landed = move_into(&file, &other).expect("move");
+        assert_eq!(landed, Some(other.join("x copy.txt")));
+        assert_eq!(read(&other.join("x.txt")), "old", "not overwritten");
+        assert_eq!(read(&other.join("x copy.txt")), "new");
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_into_its_own_directory_does_nothing() {
+        let dir = scratch("move-here");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"body").expect("write");
+        assert_eq!(move_into(&file, &dir).expect("no-op"), None);
+        assert_eq!(read(&file), "body");
+        assert!(!dir.join("notes copy.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_directory_into_itself_is_refused() {
+        let dir = scratch("move-self");
+        let src = dir.join("project");
+        std::fs::create_dir_all(src.join("sub")).expect("mkdir");
+        assert!(matches!(
+            move_into(&src, &src.join("sub")).expect_err("refused"),
+            Error::IntoSelf
+        ));
+        assert!(matches!(
+            move_into(&src, &src).expect_err("refused"),
+            Error::IntoSelf
+        ));
+        assert!(src.join("sub").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_tree_moves() {
+        let dir = scratch("move-tree");
+        let src = dir.join("project");
+        std::fs::create_dir_all(src.join("deep")).expect("mkdir");
+        std::fs::write(src.join("deep/x"), b"deep").expect("write");
+        let dst = dir.join("elsewhere");
+        std::fs::create_dir(&dst).expect("mkdir");
+        let landed = move_into(&src, &dst).expect("move").expect("moved");
+        assert_eq!(read(&landed.join("deep/x")), "deep");
+        assert!(!src.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cross_filesystem_fallback_copies_then_removes() {
+        let dir = scratch("move-copy");
+        let src = dir.join("project");
+        std::fs::create_dir_all(src.join("deep")).expect("mkdir");
+        std::fs::write(src.join("deep/x"), b"deep").expect("write");
+        let target = dir.join("landed");
+        move_by_copy(&src, &target).expect("move");
+        assert_eq!(read(&target.join("deep/x")), "deep");
+        assert!(!src.exists(), "the source goes once the copy is complete");
+
+        // A symlink to a directory is unlinked, not recursed into.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        move_by_copy(&link, &dir.join("link-copy")).expect("move");
+        assert!(!link.exists());
+        assert_eq!(read(&target.join("deep/x")), "deep", "the target survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cross_filesystem_move_keeps_the_source() {
+        let dir = scratch("move-fail");
+        let link = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &link).expect("symlink");
+        let target = dir.join("landed");
+        assert!(matches!(
+            move_by_copy(&link, &target).expect_err("an error"),
+            Error::Io(_)
+        ));
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the source stayed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "no partial target"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

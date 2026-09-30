@@ -820,7 +820,7 @@ the trash module argues about above.
 | `F2` | rename the cursor's row |
 | `Delete` | move the selection to the trash, after a `y`/`n` |
 | `Ctrl+N` | new folder |
-| `Ctrl+C` / `Ctrl+V` | copy paths to the system clipboard / paste files from it here |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut paths to the system clipboard / paste files from it here (a cut paste moves) |
 | `Ctrl+H` | show hidden files |
 | `Ctrl+S` | cycle the sort: name → size → date |
 | `Escape` | cancel an edit, or answer a confirm with "no" |
@@ -1304,22 +1304,39 @@ regrets.
   boundaries. Copy and paste are the keyboard path to the same result
   within this app.
 * **The clipboard carries paths, not file contents.**
-  * `Ctrl+C` offers the selected paths on the system clipboard, in this
-    order:
+  * `Ctrl+C` (copy) and `Ctrl+X` (cut) offer the selected paths on the
+    system clipboard, in this order:
+    * `x-special/gnome-copied-files`: `copy` or `cut` on the first line,
+      then one `file://` URI per `\n`-separated line — the form Nautilus
+      writes, and the only widely read way to say "cut".
     * `text/uri-list` (RFC 2483): one `file://` URI per CRLF-terminated
       line. Every byte of the path outside the unreserved characters and
       `/` is percent-encoded, so any file name survives the trip.
     * `text/plain;charset=utf-8` and `text/plain`: the paths joined by
       `\n`, for pasting into a terminal or a text field.
-  * `Ctrl+V` copies the files named by a `text/uri-list` on the clipboard
-    into the directory on screen. Only `file:///` and
-    `file://localhost/` URIs are accepted; other schemes and hosts are
-    skipped, and so are `#` comments.
+    * For a cut only, `application/x-kde-cutselection` with the value
+      `1`, so a paste in Dolphin moves too.
+  * `Ctrl+V` pastes the files named on the clipboard into the directory
+    on screen. `x-special/gnome-copied-files` is preferred, since it says
+    copy or cut; a bare `text/uri-list` is always a copy. Only `file:///`
+    and `file://localhost/` URIs are accepted; other schemes and hosts
+    are skipped, and so are `#` comments.
+  * A cut pastes as a move. A name that is taken is not overwritten: the
+    moved file takes the same `name copy` name a copy would. Pasting a
+    cut into the directory it came from does nothing ("already here").
+    A move across filesystems is a copy followed by deleting the source,
+    and the source is deleted only once the copy has completed; a failed
+    copy removes its partial result and leaves the original alone.
+  * After a cut paste the clipboard (this app's and the system's) is
+    cleared, as Nautilus does: the sources are gone, so a second paste
+    could only fail.
   * Without a system clipboard (a remote link, an old server), `Ctrl+V`
-    falls back to the paths this app last copied. The same happens when
-    the clipboard offers no uri-list.
-  * A paste is always a copy. There is no cut-and-paste move, because
-    `text/uri-list` has no "cut" marker to say so.
+    falls back to the paths this app last copied or cut. The same happens
+    when the clipboard offers no file list.
+  * KDE's cut marker is not read on paste (it would take a second
+    clipboard read), so a cut made in a program that offers only
+    `text/uri-list` plus that marker pastes here as a copy.
+
 * **No thumbnails.** A thumbnail means decoding images — untrusted bytes,
   a decoder dependency, a cache directory and a second thread pool — in a
   process whose whole design argument is that it does no work it was not

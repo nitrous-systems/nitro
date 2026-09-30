@@ -1,5 +1,6 @@
 //! `text/uri-list` (RFC 2483) for the clipboard: `file://` URIs from paths
-//! and back.
+//! and back, plus the GNOME `x-special/gnome-copied-files` form that also
+//! says whether the files were copied or cut.
 //!
 //! A path is OS bytes, not text, so encoding is bytewise: every byte
 //! outside the unreserved set (and `/`) is percent-encoded, which makes
@@ -90,6 +91,66 @@ fn percent_decode(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The GNOME file-manager clipboard type: an action line (`copy` or
+/// `cut`) and then one `file://` URI per line. Nautilus, Nemo, Thunar,
+/// `PCManFM` and Dolphin all read it; it is the only widely read way to say
+/// "cut".
+pub const GNOME_COPIED_FILES_MIME: &str = "x-special/gnome-copied-files";
+
+/// KDE's cut marker: offered with the value `1` alongside a uri-list when
+/// the files were cut rather than copied.
+pub const KDE_CUT_MIME: &str = "application/x-kde-cutselection";
+
+/// What a paste of the clipboard's files should do with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipOp {
+    /// Copy them; the originals stay.
+    #[default]
+    Copy,
+    /// Move them; the originals go.
+    Cut,
+}
+
+/// An `x-special/gnome-copied-files` body: `copy` or `cut`, then one URI
+/// per line, `\n`-separated with no trailing newline — the shape
+/// Nautilus writes.
+#[must_use]
+pub fn gnome_copied_files(op: ClipOp, paths: &[PathBuf]) -> String {
+    let mut out = String::from(match op {
+        ClipOp::Copy => "copy",
+        ClipOp::Cut => "cut",
+    });
+    for p in paths {
+        out.push('\n');
+        out.push_str(&path_to_file_uri(p));
+    }
+    out
+}
+
+/// Parse an `x-special/gnome-copied-files` body.
+///
+/// The first line is the action: `cut` is [`ClipOp::Cut`], anything else
+/// (`copy`, an unknown word, nothing) is [`ClipOp::Copy`] — the safe
+/// reading, since a wrong copy leaves a spare file and a wrong move loses
+/// one from where the user left it. A writer that omits the action line
+/// and starts with a URI is read as a copy of every line. The URIs go
+/// through [`parse_uri_list`], so CRLF, comments and foreign schemes are
+/// handled as there.
+#[must_use]
+pub fn parse_gnome_copied_files(s: &str) -> (ClipOp, Vec<PathBuf>) {
+    let (first, rest) = s.split_once('\n').unwrap_or((s, ""));
+    let action = first.trim_end_matches('\r').trim();
+    if action.starts_with("file:") {
+        return (ClipOp::Copy, parse_uri_list(s));
+    }
+    let op = if action == "cut" {
+        ClipOp::Cut
+    } else {
+        ClipOp::Copy
+    };
+    (op, parse_uri_list(rest))
+}
+
 /// Paths joined by `\n`, for the plain-text form of a copy.
 #[must_use]
 pub fn plain_list(paths: &[PathBuf]) -> Vec<u8> {
@@ -130,6 +191,54 @@ mod tests {
             PathBuf::from(std::ffi::OsString::from_vec(b"/x/\xff%\n".to_vec())),
         ];
         assert_eq!(parse_uri_list(&uri_list(&paths)), paths);
+    }
+
+    #[test]
+    fn gnome_copied_files_has_the_nautilus_shape() {
+        let paths = [PathBuf::from("/a"), PathBuf::from("/b c")];
+        assert_eq!(
+            gnome_copied_files(ClipOp::Copy, &paths),
+            "copy\nfile:///a\nfile:///b%20c"
+        );
+        assert_eq!(
+            gnome_copied_files(ClipOp::Cut, &paths[..1]),
+            "cut\nfile:///a"
+        );
+    }
+
+    #[test]
+    fn gnome_copied_files_round_trips() {
+        let paths = vec![
+            PathBuf::from("/tmp/a b"),
+            PathBuf::from(std::ffi::OsString::from_vec(b"/x/\xff%\n".to_vec())),
+        ];
+        for op in [ClipOp::Copy, ClipOp::Cut] {
+            assert_eq!(
+                parse_gnome_copied_files(&gnome_copied_files(op, &paths)),
+                (op, paths.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unknown_action_is_a_copy() {
+        assert_eq!(
+            parse_gnome_copied_files("file:///a\nfile:///b"),
+            (ClipOp::Copy, vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+        assert_eq!(
+            parse_gnome_copied_files("link\nfile:///a"),
+            (ClipOp::Copy, vec![PathBuf::from("/a")])
+        );
+        assert_eq!(parse_gnome_copied_files(""), (ClipOp::Copy, vec![]));
+    }
+
+    #[test]
+    fn gnome_copied_files_tolerates_crlf_and_a_trailing_newline() {
+        assert_eq!(
+            parse_gnome_copied_files("cut\r\nfile:///a\r\nfile:///b\r\n"),
+            (ClipOp::Cut, vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
     }
 
     #[test]
