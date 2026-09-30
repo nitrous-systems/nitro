@@ -11,9 +11,12 @@ export DH_VERBOSE = 1
 override_dh_auto_configure:
 
 override_dh_auto_build:
-	just PREFIX=/usr DESTDIR=$(CURDIR)/debian/nitro SUDO=none install
+	cargo build --release --workspace --bins
 
+# Staged here, not in the build step: dh_prep empties debian/nitro at the
+# start of the install sequence. cargo is a no-op after the build.
 override_dh_auto_install:
+	just PREFIX=/usr DESTDIR=$(CURDIR)/debian/nitro SUDO=none install
 
 override_dh_auto_test:
 
