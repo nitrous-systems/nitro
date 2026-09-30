@@ -134,6 +134,61 @@ modifier) and **scans it out on a plane**:
   `--hwdec dmabuf` falls back to `vaapi-download` for the same reason.
   Neither case shows a placeholder.
 
+**Scaling to the plane hint (#3956).** The server sends
+`SurfacePlaneHint`: the Surface's device-pixel size and the plane's
+downscale floor (94 % on KBL, 100 % where planes do not scale, 0 without
+planes). When the stream is larger than a plane can downscale to that
+size (`decode::scale_target`), the decode thread scales every VA frame on
+the GPU's fixed-function video engine (VPP: one
+`VAProcPipelineParameterBuffer` pass in the shim, libva directly, same
+matrix and range in and out) into a fixed pool of `SCALE_POOL` (5)
+surfaces at the hinted size, keeping the stream's aspect. The plane then
+takes the frame 1:1. It never downscales what a plane can take and never
+upscales (the plane does that). Hysteresis: the current size is kept
+while the plane can take it to the new hint (down to the floor, up to
+110 %). A rescale waits 250 ms after the last hint, so a window drag
+costs one reallocation per settle rather than one per step. A new pool is
+a new key generation: the old pool's registrations are destroyed as they
+come back from the server, not left to the LRU. If VPP cannot start or
+fails mid-stream (no VideoProc entrypoint, e.g. an old i965), the
+player logs one line and stays native. `--no-scale` turns it off for
+measurement. `--stats` adds `scale=WxH|native rescales=N min_scale=P
+scale_limited=N`; `scale_limited` counts hints in which the server said
+the Surface was off the planes because of the downscale limit, which is
+how that fallback shows up without the control socket.
+
+Measured on testhost2 (#3956, temporary `nitro-dev` unit with
+`NITRO_GPU=0`, scale 1.25, 450 frames, CPU over 6 s of steady state):
+
+| run (1080p clip, default 1600×900-device-px window, helper **off**) | layout | player CPU | player RSS | player GEM | server CPU | presented / dropped / late |
+|---|---|---|---|---|---|---|
+| VPP to the hint (default) | overlay, `NV12 Y-tiled 1600x900` (`planes_mode 1`) | 4.7–4.8 % | 56.8–59.5 MB | 53–54 MB | **2.3 %** | 450 / 0 / 0–1 |
+| `--no-scale` (before #3956) | composite, **placeholder** (`planes_mode 0`) | 4.3 % | 54.5 MB | 28.2 MB | 25.5 % | 450 / 0 / 1 |
+| `--hwdec off` (software, shm) | composite, CPU scaled blend | 24.6 % | 71.2 MB | — | 49.4 % | 450 / 0 / 23 |
+| 720p clip, software, same window (≈ a pre-scaled shm frame) | composite | 12.5 % | — | — | 42.8 % | 450 / 0 / 8 |
+
+The plane path costs the player ~0.5 % CPU (the VPP pass) and ~25 MB
+more GEM (5 scaled surfaces at 1600×900 plus the decoder's pool, which
+FFmpeg keeps at its own size), and saves the server 23 points of a core
+against the placeholder, and 47 against software decode. With the helper
+on, mode 2 was 3.0 % server CPU (#3953); VPP-to-plane is 2.3 % and the
+helper process (13.9 MB RSS) is not needed for it. Fullscreen (2560×1440,
+the plane upscales) and 720p in its window (fits) stay native
+(`rescales=0`): `planes_mode 3` and `1`, server 2.3 %.
+
+**Software decode is not scaled (#3956).** The server's CPU composite
+costs about the same whether it scales: the 720p software clip in the
+same window (a frame already smaller than its rect, as a swscale'd one
+would be) still costs the server 43 % against 49 % for 1080p, and the
+player would add swscale's per-frame cost and a new mapped library. Not
+taken; software decode stays native.
+
+**box1 (HSW)** has no plane scaler and no plane that takes Y-tiled NV12,
+so VA-API there falls back to software (above) and the hint buys nothing:
+a shm Surface is composited whatever its size. A producer that does
+render dma-bufs a Haswell plane takes (linear YUYV on the overlay) would
+get `min_scale_pct 100` and render exactly at the node's size.
+
 **Buffer pool.** FFmpeg's VA pool is dynamic (VA-API ≥ 1), so it grows
 to the decoder's references plus what is in flight; `extra_hw_frames = 4`
 sizes a fixed pool the same way. The decode thread keeps at most `RING`

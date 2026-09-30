@@ -192,7 +192,7 @@ Stats: `planes_mode` (max over outputs), `planes_in_use`,
 `planes_candidates`, `planes_obscured`, `planes_tests`,
 `planes_cache_hits`, `planes_fallbacks`, `planes_switches`,
 `plane_flips`, `plane_releases_held`, `plane_fences`,
-`plane_fence_latches`. Numbers:
+`plane_fence_latches`, `plane_reject_scale`, `planes_scale_limited` (#3956). Numbers:
 [`budget.md`](budget.md) "Planes (#3899)".
 
 ## Fallback chain for one Surface
@@ -201,6 +201,16 @@ Stats: `planes_mode` (max over outputs), `planes_in_use`,
 2. underlay with a hole in the shadow buffer;
 3. GPU helper composite;
 4. CPU convert + scale into the shadow buffer.
+
+A Surface that drops out of step 1 **because of the plane scaling
+limit** is not a silent fallback (#3956). The server logs it once per
+Surface per state change ("off planes: 1920x1080 -> 1601x900 is 83%
+(planes take >= 94%); shown by GPU helper | CPU scaled blend |
+placeholder", and "scale limit cleared: back on a plane | no longer
+scale-limited | gone"). It counts `plane_reject_scale` (entries) and
+`planes_scale_limited` (a gauge), and tells the producer through
+`SurfacePlaneHint`'s `SCALE_LIMITED` flag. See § As built: the plane
+size hint.
 
 Step 4 works everywhere — simpledrm, VMs, machines with no Mesa — and is
 **built first**. Every other step is an optimisation that falls back to it.
@@ -326,6 +336,50 @@ side: `crates/nitro-server/src/dmabuf.rs`.
   is defined only at the latch. The server does not check that a fence
   fd is a `sync_file`: a fence that never signals stalls only the
   sender's surface.
+
+### As built: the plane size hint (#3956)
+
+KBL planes downscale only to ~0.94×, and HSW planes do not scale. So a
+Surface whose buffer is much larger than its on-screen rect cannot go on
+a plane. The default nitro-video window showing a 1080p clip at scale
+1.25 is 0.83×. Before #3956 the server fell back silently: mode 2 if the
+helper ran, else the placeholder (tiled) or a CPU scaled blend (linear).
+
+- **Wire.** `SurfaceHint` already carried the node's device size. What
+  was missing was the plane's floor. `SurfacePlaneHint` (0x830c, behind
+  the new cap `PLANE_HINT`, bit 18) carries the size, `min_scale_pct`
+  (`planes::min_scale_pct`: 94 / 100 / 0) and the informational
+  `SCALE_LIMITED` flag. It is sent on first size and on any change.
+  Producers decide from size and ratio only, so there is no feedback
+  loop.
+- **Server.** `planes::check` gives the reason a plane refuses a
+  candidate (`Reject::{Format, Scale, Color}`). `planes::scale_limited`
+  is true when no non-cursor plane takes the candidate and some plane
+  refuses it for scale alone. After each decision `plan_planes` records
+  the set per output (`Output.scale_limited`), logs entries and exits
+  once, counts them, and pushes the plane hints only when the set
+  changed (it never re-sends `DmabufFeedback`).
+- **nitro-video.** With VA-API it scales on the video engine (VPP) to
+  the hinted size, and only when the plane could not take the stream as
+  it is. It uses hysteresis and a 250 ms debounce. Measured on testhost2
+  with the helper off: `planes_mode 1`, a real picture, server 2.3 % CPU
+  (placeholder: 25.5 %; software: 49 %). Software decode is not scaled
+  (measured: no net win), see `crates/nitro-video/README.md`.
+- **The /2 idea, not built.** The idea is to have the GPU helper produce
+  a half-size intermediate for a plane when a producer ignores the hint.
+  It would still wake the 3D engine every frame, which is exactly mode
+  2's cost (3.0 % server CPU on testhost2 for this clip, #3953). The
+  only saving would be a smaller render target than mode 2's
+  damage-clipped composite. It would also lose detail: the 1080p frame
+  would show as 960 px upscaled to 1600. With producers rendering to the
+  hint, the plane path is 2.3 % with no helper at all, and mode 2 stays
+  the fallback for producers that ignore it. /2 does not beat plain
+  mode 2 by enough to justify a second composite path.
+- **box1 (HSW).** No plane scaler and no plane lists Y-tiled NV12, so
+  VA-API video is software/shm there and composited whatever its size.
+  The hint buys nothing for nitro-video on box1. A producer of
+  plane-compatible buffers (linear YUYV) gets `min_scale_pct 100` and
+  renders exactly at the node's size.
 
 ## Protocol needs
 

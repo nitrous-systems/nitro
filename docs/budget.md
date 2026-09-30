@@ -1920,6 +1920,27 @@ fenced frames. Idle `nitro-server` on box1: 18.8 MB RSS, 10.4 MB anon,
 0 % CPU. `nitro-video` byte-identical (835 512 B); no crate added. Table:
 `crates/nitro-video/README.md` §Measurements (#3923).
 
+### #3956: plane downscale limit, VPP to the hint
+
+testhost2 (KBL, eDP 2560×1440 at scale 1.25), GPU helper off, 1080p clip
+in nitro-video's default 1600×900-device-px window (0.83×, under the
+planes' 0.94× floor):
+
+| run (1080p clip, default 1600×900-device-px window, helper **off**) | layout | player CPU | player RSS | player GEM | server CPU | presented / dropped / late |
+|---|---|---|---|---|---|---|
+| VPP to the hint (default) | overlay, `NV12 Y-tiled 1600x900` (`planes_mode 1`) | 4.7–4.8 % | 56.8–59.5 MB | 53–54 MB | **2.3 %** | 450 / 0 / 0–1 |
+| `--no-scale` (before #3956) | composite, **placeholder** (`planes_mode 0`) | 4.3 % | 54.5 MB | 28.2 MB | 25.5 % | 450 / 0 / 1 |
+| `--hwdec off` (software, shm) | composite, CPU scaled blend | 24.6 % | 71.2 MB | — | 49.4 % | 450 / 0 / 23 |
+| 720p clip, software, same window (≈ a pre-scaled shm frame) | composite | 12.5 % | — | — | 42.8 % | 450 / 0 / 8 |
+
+Server CPU 25.5 % → **2.3 %** (placeholder → overlay plane), player
++0.5 % CPU and +25 MB GEM for the 5-surface VPP pool. Footprint:
+stripped `nitro-server` +6.0 KB (3 481 376 → 3 487 472 B; budget
++8 KB), `nitro-video` +11.7 KB (835 512 → 847 472 B; budget +16 KB),
+server state one `Vec<NodeKey>` and a `u8` per output. libva was already
+mapped in nitro-video; no crate. Details:
+`crates/nitro-video/README.md` § Scaling to the plane hint.
+
 ## Dependency count
 
 Latest: **106** lines and **44** distinct external names with the lock

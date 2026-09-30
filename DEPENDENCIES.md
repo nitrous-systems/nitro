@@ -595,12 +595,18 @@ that `nitro-amp` uses:
 
 The C boundary is eight functions returning integers, doubles, byte
 buffers and fds (`nv_open`/`nv_info`/`nv_hw_info`/`nv_seek`/`nv_next`/
-`nv_next_hw`/`nv_release`/`nv_close`), so the Rust side declares **no
+`nv_next_hw`/`nv_release`/`nv_set_scale`/`nv_take_scale_error`/`nv_close`), so the Rust side declares **no
 FFmpeg struct layout** — those change between majors. VA-API decode
 (#3923) goes through libavutil's `hwcontext` (`AV_HWDEVICE_TYPE_VAAPI`,
-`av_hwframe_map` to DRM PRIME); `libva`/`libva-drm` come in only
-transitively through libavutil, the shim calls nothing in them, and the
-DRM fourccs it compares are spelled out, so no libdrm header either.
+`av_hwframe_map` to DRM PRIME); `libva-drm` comes in only transitively
+through libavutil. Since #3956 the shim calls `libva` itself for VPP
+scaling (`vaCreateConfig`/`vaCreateContext`/`vaCreateBuffer`,
+`vaBeginPicture`/`vaRenderPicture`/`vaEndPicture` with a
+`VAProcPipelineParameterBuffer`), so `libva` is linked directly (build.rs
+asks pkg-config for it; `libva-dev` to build). It was already mapped
+through libavutil's VAAPI hwcontext: no new runtime library, no crate,
+and libavfilter is still not used. The DRM fourccs the shim compares are
+spelled out, so no libdrm header either.
 That is the tree's third `unsafe` exception, below. Footprint: stripped
 `nitro-video` and the mapped libav* size and RSS are in `docs/budget.md`
 § "nitro-video (#3906)".
