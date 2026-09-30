@@ -1748,7 +1748,7 @@ fn paint_item_as(
     }
     if let Some(readable) = shot {
         let surface = match item.kind {
-            PaintKind::Hole { size } => scene
+            PaintKind::Hole { size, .. } => scene
                 .node(item.node)
                 .ok()
                 .and_then(nitro_scene::Node::surface)

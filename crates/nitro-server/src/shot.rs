@@ -139,7 +139,7 @@ impl Server {
         let mut placeholders: Vec<ShotReason> = Vec::new();
         for item in &items {
             let (size, hole) = match item.kind {
-                PaintKind::Hole { size } => (size, true),
+                PaintKind::Hole { size, .. } => (size, true),
                 PaintKind::Surface { size, .. } => (size, false),
                 _ => continue,
             };
