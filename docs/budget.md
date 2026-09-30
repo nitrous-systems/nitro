@@ -1702,11 +1702,17 @@ Stated budget: server binary +≤80 KB, RssAnon +≤200 KB, helper
 byte-identical, other binaries byte-identical.
 
 - **Server binary: +140 KB** (3 337 416 → 3 481 184 bytes, release,
-  x86-64), **60 KB over budget**. Most of it is the `nitro-gpu` codec
-  (every message's encode and decode, `DeviceInfo` tables) plus
-  `gpu.rs` and the mode-2 frame path. A follow-up could split the codec
-  so the server links only the halves it uses (encode `ToHelper`,
-  decode `FromHelper`).
+  x86-64), **60 KB over budget**. `cargo bloat` diff against 4383588
+  (#3946): ~46 KB is `gpu.rs` and the other `gpu_*` code, ~41 KB is
+  the mode-2 planner and frame path (`paint`, `paint_shadow`,
+  `Planner::decide`), ~30 KB is `std::process::Command` (spawn, and the
+  `env` map for `NITRO_GPU_IDLE_EXIT`), and ~10 KB is other `std` and
+  `nitro_wire`. The `nitro-gpu` codec is only ~7 KB, almost all of it
+  `ToHelper` encode (inlined into `Conn::send`) and `FromHelper` decode.
+  Fat LTO already drops the halves the server does not call, so
+  splitting the codec would save nothing, and it was not done (#3946).
+  Nothing else is worth trimming: dropping `Command` means `unsafe`
+  fork/exec, and moving the env var to argv changes the helper.
 - **RssAnon:** the texture map, the fence dups and the ring bookkeeping
   are a few KB. The shadow of the output in mode 2 moves from RssAnon to
   RssShmem (8 MB at 1080p, page-padded), only on an output that has
