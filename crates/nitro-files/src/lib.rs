@@ -812,6 +812,13 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 // the widget it reads the count from — is out of its
                 // slot while this runs: deferred, like `on_activate`.
                 ui.defer(show_status);
+            })
+            .on_drag(|s: &mut Files, ui: &mut Ui<Files>, selection: &[usize]| {
+                // Not deferred: the button is down now, and the server
+                // takes a `StartDrag` only while it is. The list is out
+                // of its slot, which is why it hands over the indices.
+                let paths: Vec<PathBuf> = selection.iter().filter_map(|i| s.path_at(*i)).collect();
+                start_file_drag(s, ui, paths);
             }),
     );
 
@@ -1730,6 +1737,136 @@ fn commit_edit(s: &mut Files, ui: &mut Ui<Files>, text: &str) {
 
 // -- copy and paste ---------------------------------------------------
 
+/// `paths` as `text/uri-list` and as text: what a copy and a drag both
+/// offer, in that order.
+fn path_items(paths: &[PathBuf]) -> Vec<(String, Vec<u8>)> {
+    let list = uri::uri_list(paths).into_bytes();
+    let text = uri::plain_list(paths);
+    vec![
+        (URI_LIST_MIME.to_owned(), list),
+        (TEXT_MIME.to_owned(), text.clone()),
+        (PLAIN_MIME.to_owned(), text),
+    ]
+}
+
+// -- dragging out -----------------------------------------------------
+
+/// The actions a drag of `paths` offers: copy and link always, and move
+/// only when the user could move every one of them from here — its
+/// directory is writable, it is not in the trash, and it is not a
+/// sidebar place. See `docs/files.md` § Drag and drop.
+#[must_use]
+pub fn drag_actions_for(s: &Files, paths: &[PathBuf]) -> u32 {
+    use nitro_ui::dnd::drag_actions;
+    let trash = s.trash.root();
+    let movable = !paths.is_empty()
+        && paths.iter().all(|p| {
+            let writable = p
+                .parent()
+                .is_some_and(|d| rustix::fs::access(d, rustix::fs::Access::WRITE_OK).is_ok());
+            writable && !p.starts_with(trash) && !s.places.iter().any(|pl| pl.path == *p)
+        });
+    let mut actions = drag_actions::COPY | drag_actions::LINK;
+    if movable {
+        actions |= drag_actions::MOVE;
+    }
+    actions
+}
+
+/// Start dragging `paths` out of the window: offered exactly as a copy
+/// offers them, under an icon naming what is dragged. Nothing happens
+/// without the system data channel (a remote link).
+fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: Vec<PathBuf>) {
+    use nitro_ui::dnd::{DragIcon, DragSource};
+    if paths.is_empty() || !ui.can_drag() {
+        return;
+    }
+    let (icon_name, text) = match paths.as_slice() {
+        [one] => {
+            let icon = s
+                .entries
+                .iter()
+                .find(|e| one.file_name().is_some_and(|n| n.to_string_lossy() == e.name))
+                .map_or("file-earmark", |e| e.icon);
+            (icon, short(one))
+        }
+        many => ("files", format!("{} items", many.len())),
+    };
+    let root = ui.build(
+        row()
+            .gap(6.0)
+            .padding_xy(8.0, 4.0)
+            .child(nitro_ui::widgets::icon(icon_name).fallback("file-earmark"))
+            .child(label(text).size(nitro_ui::split::SMALL_PX)),
+    );
+    let icon = ui.build(nitro_ui::widgets::panel().radius(6.0).padding(0.0));
+    if let Err(e) = ui.attach(icon, root) {
+        complain("the drag icon", &e);
+        return;
+    }
+    let offer = DragSource {
+        items: path_items(&paths),
+        actions: drag_actions_for(s, &paths),
+        icon: Some(DragIcon {
+            root: icon,
+            size: None,
+            offset: nitro_ui::Point::new(8.0, 8.0),
+        }),
+    };
+    let n = paths.len();
+    let dragged = paths.clone();
+    match ui.start_drag(nitro_ui::WindowId::MAIN, offer, move |s: &mut Files, ui, o| {
+        drag_finished(s, ui, &dragged, o);
+    }) {
+        Ok(true) => {
+            s.message = Some(if n == 1 {
+                "dragging 1 item".to_owned()
+            } else {
+                format!("dragging {n} items")
+            });
+        }
+        Ok(false) => {
+            let _ = ui.remove(icon);
+        }
+        Err(e) => {
+            let _ = ui.remove(icon);
+            s.message = Some(format!("drag: {e}"));
+        }
+    }
+    ui.defer(show_status);
+}
+
+/// A drag of ours ended. The target does the work — a move of
+/// `file://` URIs is the target's to perform — so this side deletes
+/// nothing: it re-lists, and calls it a move only if the files went.
+fn drag_finished(
+    s: &mut Files,
+    ui: &mut Ui<Files>,
+    paths: &[PathBuf],
+    o: nitro_ui::dnd::DragOutcome,
+) {
+    use nitro_ui::dnd::DragAction;
+    let what = if paths.len() == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{} items", paths.len())
+    };
+    s.message = if o.accepted {
+        let how = match o.action {
+            DragAction::Move if paths.iter().all(|p| p.symlink_metadata().is_err()) => "move",
+            DragAction::Move | DragAction::Copy | DragAction::None => "copy",
+            DragAction::Link => "link",
+        };
+        Some(format!("dropped {what} ({how})"))
+    } else {
+        None
+    };
+    if o.accepted && o.action == DragAction::Move {
+        relist(s, ui);
+    }
+    show_status(s, ui);
+}
+
 /// Remember the selection for a later paste (a move, for a cut), and
 /// offer it on the system clipboard as `x-special/gnome-copied-files`,
 /// `text/uri-list` and the paths as text — plus KDE's cut marker for a
@@ -1740,14 +1877,8 @@ fn offer_selection(s: &mut Files, ui: &mut Ui<Files>, op: uri::ClipOp) {
         return;
     }
     let gnome = uri::gnome_copied_files(op, &paths).into_bytes();
-    let list = uri::uri_list(&paths).into_bytes();
-    let text = uri::plain_list(&paths);
-    let mut items = vec![
-        (uri::GNOME_COPIED_FILES_MIME.to_owned(), gnome),
-        (URI_LIST_MIME.to_owned(), list),
-        (TEXT_MIME.to_owned(), text.clone()),
-        (PLAIN_MIME.to_owned(), text),
-    ];
+    let mut items = vec![(uri::GNOME_COPIED_FILES_MIME.to_owned(), gnome)];
+    items.extend(path_items(&paths));
     if op == uri::ClipOp::Cut {
         items.push((uri::KDE_CUT_MIME.to_owned(), b"1".to_vec()));
     }

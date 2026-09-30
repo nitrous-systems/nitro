@@ -1376,7 +1376,7 @@ impl ClipboardPeer {
     }
 
     /// Open a small undecorated window to drop on, at `DRAG_WINDOW`
-    /// size; returns its node id and where the server put it.
+    /// size on the `Top` layer; returns its node id and where the server put it.
     ///
     /// # Panics
     /// On a wire failure or a timeout.
@@ -1394,7 +1394,9 @@ impl ClipboardPeer {
                 root,
                 "drop target",
                 DRAG_WINDOW,
-                Layer::Normal,
+                // Above every normal window: a press raises the source,
+                // and a test's source window may cover the whole output.
+                Layer::Top,
                 window_flags::UNDECORATED,
             )
             .create_rect(

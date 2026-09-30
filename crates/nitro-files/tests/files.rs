@@ -2406,3 +2406,157 @@ fn an_inotify_rescan_neither_wipes_the_message_nor_flickers() {
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }
+
+// -- dragging files out ----------------------------------------------------
+
+/// Row `row`'s middle in output coordinates.
+fn row_abs(h: &mut Harness<Files>, ids: Ids, row: usize) -> Point {
+    let origin = h.ui().window_position_of(nitro_ui::WindowId::MAIN);
+    let b = h.ui().window_bounds(ids.list);
+    let row_h = h.widget::<List<Files>>(ids.list).row_height();
+    Point::new(
+        origin.x + b.x + 20.0,
+        origin.y + b.y + row_h * (row as f32 + 0.5),
+    )
+}
+
+/// Press on `row`, drag past the threshold, then onto `to`.
+fn drag_row(h: &mut Harness<Files>, ids: Ids, row: usize, to: Point) {
+    let p = row_abs(h, ids, row);
+    h.move_pointer_abs(p);
+    h.press(nitro_ui::event::button::LEFT);
+    h.move_pointer_abs(Point::new(p.x + 12.0, p.y));
+    h.move_pointer_abs(to);
+}
+
+fn mid(r: nitro_ui::Rect) -> Point {
+    Point::new(r.x + r.w / 2.0, r.y + r.h / 2.0)
+}
+
+#[test]
+fn a_row_dragged_onto_a_target_offers_the_uri_list_ctrl_c_offers() {
+    use nitro_ui::dnd::{DragAction, drag_actions};
+    let (root, dir) = fixture("drag-out");
+    write(&dir.join("my note.txt"), "x");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let mut peer = ClipboardPeer::new(&h, "target");
+    let (_, target) = peer.target_window(&mut h);
+    drag_row(&mut h, ids, 0, mid(target));
+    let (mimes, actions) = peer.drag_entered(&mut h);
+    assert_eq!(
+        mimes,
+        ["text/uri-list", "text/plain;charset=utf-8", "text/plain"]
+    );
+    assert_eq!(
+        actions,
+        drag_actions::COPY | drag_actions::MOVE | drag_actions::LINK
+    );
+    assert!(status(&h, ids).contains("dragging 1 item"), "{}", status(&h, ids));
+    peer.accept_drop(&mut h, DragAction::Copy, "text/uri-list");
+    h.release(nitro_ui::event::button::LEFT);
+    peer.dropped(&mut h);
+    let path = dir.join("my note.txt");
+    let want = format!("file://{}\r\n", path.display()).replace(' ', "%20");
+    assert_eq!(
+        String::from_utf8(peer.read_drag(&mut h, 1, "text/uri-list")).unwrap(),
+        want
+    );
+    assert_eq!(
+        peer.read_drag(&mut h, 2, "text/plain;charset=utf-8"),
+        path.to_str().unwrap().as_bytes()
+    );
+    peer.finish_drop(&mut h);
+    h.settle();
+    assert!(status(&h, ids).contains("dropped 1 item (copy)"), "{}", status(&h, ids));
+    assert!(path.exists(), "the source deletes nothing");
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_drag_of_several_rows_carries_every_path() {
+    use nitro_ui::dnd::DragAction;
+    let (root, dir) = fixture("drag-many");
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        write(&dir.join(n), n);
+    }
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let mut peer = ClipboardPeer::new(&h, "target");
+    let (_, target) = peer.target_window(&mut h);
+    let (p0, p2) = (row_abs(&mut h, ids, 0), row_abs(&mut h, ids, 2));
+    h.move_pointer_abs(p0);
+    h.press(nitro_ui::event::button::LEFT);
+    h.release(nitro_ui::event::button::LEFT);
+    h.key_down(key::LEFT_SHIFT);
+    h.move_pointer_abs(p2);
+    h.press(nitro_ui::event::button::LEFT);
+    h.release(nitro_ui::event::button::LEFT);
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(h.widget::<List<Files>>(ids.list).selection(), [0, 1, 2]);
+    drag_row(&mut h, ids, 1, mid(target));
+    peer.drag_entered(&mut h);
+    assert!(status(&h, ids).contains("dragging 3 items"), "{}", status(&h, ids));
+    peer.accept_drop(&mut h, DragAction::Copy, "text/plain;charset=utf-8");
+    h.release(nitro_ui::event::button::LEFT);
+    peer.dropped(&mut h);
+    let text = String::from_utf8(peer.read_drag(&mut h, 1, "text/plain;charset=utf-8")).unwrap();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        assert!(text.contains(dir.join(n).to_str().unwrap()), "{text}");
+    }
+    peer.finish_drop(&mut h);
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_drop_on_nothing_leaves_the_files_alone() {
+    let (root, dir) = fixture("drag-nothing");
+    write(&dir.join("keep.txt"), "x");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let p = row_abs(&mut h, ids, 0);
+    drag_row(&mut h, ids, 0, Point::new(p.x + 40.0, p.y + 40.0));
+    assert!(h.ui().drag_in_flight());
+    h.key(key::ESC);
+    h.release(nitro_ui::event::button::LEFT);
+    h.settle();
+    assert!(!h.ui().drag_in_flight());
+    assert!(!status(&h, ids).contains("dropped"), "{}", status(&h, ids));
+    assert!(!status(&h, ids).contains("dragging"), "{}", status(&h, ids));
+    assert!(dir.join("keep.txt").exists());
+    assert_eq!(names_of(&h, ids), ["keep.txt"]);
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn move_is_offered_only_out_of_a_writable_directory() {
+    use nitro_ui::dnd::drag_actions;
+    use std::os::unix::fs::PermissionsExt as _;
+    let (root, dir) = fixture("drag-ro");
+    let ro = dir.join("ro");
+    std::fs::create_dir_all(&ro).unwrap();
+    write(&ro.join("f.txt"), "x");
+    write(&dir.join("g.txt"), "x");
+    let (h, _ids) = app(&dir, &root.join("xdg"));
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let s = h.state();
+    let rw = nitro_files::drag_actions_for(s, &[dir.join("g.txt")]);
+    assert_eq!(rw, drag_actions::COPY | drag_actions::MOVE | drag_actions::LINK);
+    // root can write anywhere: the rule is `access(W_OK)`, not the mode.
+    let writable = rustix::fs::access(&ro, rustix::fs::Access::WRITE_OK).is_ok();
+    let got = nitro_files::drag_actions_for(s, &[ro.join("f.txt")]);
+    if writable {
+        assert_eq!(got, rw);
+    } else {
+        assert_eq!(got, drag_actions::COPY | drag_actions::LINK);
+    }
+    // Nothing moves out of the trash or off a sidebar place.
+    let places: Vec<PathBuf> = s.places().iter().map(|p| p.path.clone()).collect();
+    assert_eq!(
+        nitro_files::drag_actions_for(s, &places[..1]),
+        drag_actions::COPY | drag_actions::LINK
+    );
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
