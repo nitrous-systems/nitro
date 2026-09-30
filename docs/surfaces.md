@@ -554,7 +554,7 @@ Known residuals: a translucent tiled Surface is captured opaque (as mode
 ### Recording design (not built)
 
 Continuous capture for screen recording and video calls reuses the
-shot's parts; it is its own work item (issue linked from the work plan).
+shot's parts; it is its own work item (issue #676).
 
 - **Who composites.** The helper, every frame the output changes: the
   same layer list as a mode-2 frame (shadow + Surface layers), drawn into

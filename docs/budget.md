@@ -1941,6 +1941,37 @@ server state one `Vec<NodeKey>` and a `u8` per output. libva was already
 mapped in nitro-video; no crate. Details:
 `crates/nitro-video/README.md` § Scaling to the plane hint.
 
+## Shots with Surface content (#3962)
+
+`shot` fills in Surfaces on planes and under the GPU helper
+(`docs/surfaces.md` § Capture). **Idle cost: zero.** Nothing is held
+between shots: the server's image copy (w×h×4, 14.7 MB at 2560×1440)
+lives until the reply is written, the helper's capture target and staging
+buffer only inside the `Capture` call, and textures imported for a shot
+are released after it.
+
+Measured on testhost2 (KBL, eDP 2560×1440, scale 1.25, helper always-on,
+`nitro-dev` unit), 2026-09-30. `shot_us` is request → reply in the
+server; the wall time is `nitro-shot -o x.png` end to end, PNG encoding
+and the 14.7 MB transfer included:
+
+| screen | how the Surface was drawn | `shot_us` | wall |
+|---|---|---|---|
+| desktop, no Surfaces | shadow copy | 5.2 ms | 0.06 s |
+| VA-API video fullscreen, direct scanout (`planes_mode 3`) | helper `Capture` (tiled NV12) | 62 ms | 0.11–0.15 s |
+| VA-API video windowed, overlay (`planes_mode 1`) | helper `Capture` | 38 ms | 0.09–0.11 s |
+| two overlapping videos, helper-composited (`planes_mode 2`) | helper `Capture`, 2 layers | 40 ms | 0.10–0.18 s |
+| Chromium GPU window (ANGLE-Vulkan, linear dma-bufs) | CPU from the buffer | 4.4–5.9 ms | 0.06 s |
+
+Memory: helper `drm_total` identical before and after a shot (71 831 552
+→ 71 831 552 in mode 3; 82 337 792 → 82 337 792 in mode 1); server
+RssAnon back to its pre-shot value after each (e.g. 2 632 → 2 696 kB,
+noise). `gpu_textures 0` after shots in modes 0/3, i.e. the shot's
+imports were released. Binary sizes against `main` (release): 
+`nitro-server` 3 487 496 → 3 514 760 (+27 264, +0.78 %), `nitro-shot`
+333 352 → 337 976 (+4 624), `nitro-gpu-vulkan` 582 624 → 594 496
+(+11 872).
+
 ## Dependency count
 
 Latest: **106** lines and **44** distinct external names with the lock
