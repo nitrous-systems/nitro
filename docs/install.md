@@ -24,6 +24,13 @@ root, `sudo chown -R $USER target` fixes it. Re-running an install
 updates the files in place.
 
 
+## Distribution packages
+
+`just dist-deb-ubuntu-lts`, `dist-deb-ubuntu`, `dist-deb-debian`,
+`dist-arch` and `dist-alpine` build native packages in podman or docker
+containers. Each one wraps `just install` as described here. See
+[packaging.md](packaging.md).
+
 ## Variables
 
 | variable | default | |
