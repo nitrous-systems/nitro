@@ -12,6 +12,9 @@
 //!    │                     │  └──────────────answer────────────────────┘
 //!    └──error / cancel─────┤
 //!                          └──success──▶ Authenticated
+//!                                          │ start_session (greeter only)
+//!                                          ▼
+//!                  User ◀──error──────── Starting ──success──▶ Started
 //! ```
 //!
 //! greetd answers every request with exactly one response, in order.
@@ -21,8 +24,9 @@
 //! recognised and dropped rather than taken for the end of the new
 //! one.
 //!
-//! The greeter (plan step 5) will add a `Session` step after `success`
-//! (choose a session, send `start_session`); in lock mode `success` is
+//! The greeter adds a step after `success`: [`Conversation::start_session`]
+//! sends greetd the chosen session's command, and its `success` is
+//! [`State::Started`] (the greeter exits 0). In lock mode `success` is
 //! the end.
 
 use std::collections::VecDeque;
@@ -45,6 +49,10 @@ pub enum State {
     },
     /// The user is authenticated.
     Authenticated,
+    /// `start_session` is in flight (greeter mode).
+    Starting,
+    /// greetd accepted the session: it starts once the greeter exits.
+    Started,
 }
 
 /// What an unanswered request was.
@@ -147,6 +155,20 @@ impl Conversation {
         }
     }
 
+    /// Cancel whatever the authenticator may have open from a previous
+    /// client, whether or not this one opened it: a greeter restarted
+    /// after a crash finds greetd still holding its predecessor's
+    /// `create_session` ("a session is already being configured"). The
+    /// answer, `success` or an error, is dropped.
+    pub fn reset(&mut self) -> Vec<Request> {
+        for s in &mut self.outstanding {
+            *s = Sent::Stale;
+        }
+        self.outstanding.push_back(Sent::Stale);
+        self.open = false;
+        vec![Request::CancelSession]
+    }
+
     /// Start an attempt for `name`. Sends `cancel_session` first if a
     /// conversation is in flight: greetd refuses a second
     /// `create_session` otherwise.
@@ -182,11 +204,23 @@ impl Conversation {
         }]
     }
 
+    /// Ask greetd to start `cmd` for the authenticated user. Only in
+    /// [`State::Authenticated`]; ignored otherwise.
+    pub fn start_session(&mut self, cmd: Vec<String>, env: Vec<String>) -> Vec<Request> {
+        if self.state != State::Authenticated {
+            return Vec::new();
+        }
+        self.open = true;
+        self.outstanding.push_back(Sent::Live);
+        self.state = State::Starting;
+        vec![Request::StartSession { cmd, env }]
+    }
+
     /// Give up on the attempt and go back to the user name.
     pub fn cancel(&mut self) -> Vec<Request> {
         let mut out = Vec::new();
         self.cancel_open(&mut out);
-        if self.state != State::Authenticated {
+        if !matches!(self.state, State::Authenticated | State::Started) {
             self.state = State::User;
         }
         out
@@ -197,7 +231,7 @@ impl Conversation {
     pub fn lost(&mut self, description: &str) {
         self.outstanding.clear();
         self.open = false;
-        if self.state != State::Authenticated {
+        if !matches!(self.state, State::Authenticated | State::Started) {
             self.state = State::User;
             self.last_error = Some((ErrorKind::Error, description.to_owned()));
         }
@@ -224,17 +258,31 @@ impl Conversation {
                 self.outstanding.push_back(Sent::Live);
                 vec![Request::PostAuthMessageResponse { response: None }]
             }
-            Response::Success => {
+            Response::Success if self.state == State::Starting => {
                 self.open = false;
+                self.state = State::Started;
+                Vec::new()
+            }
+            Response::Success => {
                 self.last_error = None;
                 self.state = State::Authenticated;
+                // greetd's session stays open for `start_session`; the
+                // helper's conversation is over. Either way a new
+                // attempt must cancel it first in greeter mode, which
+                // `open` tracks: it is left set so `cancel` sends one.
                 Vec::new()
             }
             Response::Error { kind, description } => {
+                let mut out = Vec::new();
+                if self.state == State::Starting {
+                    // The session could not start: greetd keeps the
+                    // half-made one until told otherwise.
+                    self.cancel_open(&mut out);
+                }
                 self.open = false;
                 self.last_error = Some((kind, description));
                 self.state = State::User;
-                Vec::new()
+                out
             }
         }
     }
@@ -472,5 +520,103 @@ mod tests {
         assert_eq!(c.state(), &State::User);
         assert!(!c.busy());
         assert_eq!(c.submit_user("alice"), [create("alice")], "no stale cancel");
+    }
+
+    fn authenticated() -> Conversation {
+        play(vec![
+            User("alice", vec![create("alice")]),
+            Recv(
+                ask(Secret, "Password: "),
+                vec![],
+                prompt(Secret, "Password: "),
+            ),
+            Answer("hunter2", vec![post("hunter2")]),
+            Recv(Response::Success, vec![], State::Authenticated),
+        ])
+    }
+
+    fn start() -> Request {
+        Request::StartSession {
+            cmd: vec!["nitro-session".into()],
+            env: vec!["XDG_SESSION_DESKTOP=nitro".into()],
+        }
+    }
+
+    #[test]
+    fn the_greeter_starts_a_session_after_success() {
+        let mut c = authenticated();
+        assert_eq!(
+            c.start_session(
+                vec!["nitro-session".into()],
+                vec!["XDG_SESSION_DESKTOP=nitro".into()]
+            ),
+            [start()]
+        );
+        assert_eq!(c.state(), &State::Starting);
+        assert!(c.busy());
+        assert!(c.on_response(Response::Success).is_empty());
+        assert_eq!(c.state(), &State::Started);
+        assert!(!c.busy());
+    }
+
+    #[test]
+    fn start_session_is_only_valid_once_authenticated() {
+        let mut c = Conversation::new();
+        assert!(c.start_session(vec!["x".into()], vec![]).is_empty());
+        c.submit_user("alice");
+        assert!(c.start_session(vec!["x".into()], vec![]).is_empty());
+        assert_eq!(c.state(), &State::Waiting);
+    }
+
+    #[test]
+    fn a_start_session_error_returns_to_the_name_and_cancels() {
+        let mut c = authenticated();
+        c.start_session(vec!["nope".into()], vec![]);
+        let out = c.on_response(Response::Error {
+            kind: ErrorKind::Error,
+            description: "exec failed".into(),
+        });
+        assert_eq!(out, [Request::CancelSession]);
+        assert_eq!(c.state(), &State::User);
+        assert_eq!(c.last_error().map(|e| e.1.as_str()), Some("exec failed"));
+        // The cancel's own answer is dropped, and a new attempt starts
+        // without a second cancel.
+        c.on_response(Response::Success);
+        assert_eq!(c.state(), &State::User);
+        assert_eq!(c.submit_user("alice"), [create("alice")]);
+    }
+
+    #[test]
+    fn a_cancel_while_starting_cancels_and_drops_the_answer() {
+        let mut c = authenticated();
+        c.start_session(vec!["nitro-session".into()], vec![]);
+        assert_eq!(c.cancel(), [Request::CancelSession]);
+        assert_eq!(c.state(), &State::User);
+        // start_session's success, then the cancel's: both stale.
+        c.on_response(Response::Success);
+        c.on_response(Response::Success);
+        assert_eq!(c.state(), &State::User);
+        assert!(!c.busy());
+    }
+
+    #[test]
+    fn a_new_name_after_success_cancels_greetds_open_session_first() {
+        let mut c = authenticated();
+        assert_eq!(
+            c.submit_user("bob"),
+            [Request::CancelSession, create("bob")]
+        );
+    }
+
+    #[test]
+    fn reset_cancels_unconditionally_and_drops_the_answer() {
+        let mut c = Conversation::new();
+        assert_eq!(c.reset(), [Request::CancelSession]);
+        assert_eq!(c.submit_user("alice"), [create("alice")]);
+        // The cancel's error (nothing was open) is not alice's answer.
+        c.on_response(auth_error("no session"));
+        assert_eq!(c.state(), &State::Waiting);
+        c.on_response(ask(Secret, "Password: "));
+        assert_eq!(c.state(), &prompt(Secret, "Password: "));
     }
 }

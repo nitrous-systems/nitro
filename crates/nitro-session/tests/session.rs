@@ -1017,3 +1017,56 @@ fn a_crashed_lock_screen_is_restarted() {
     );
     session.teardown();
 }
+
+/// The `--greeter` profile's pieces, with stub arguments for the greeter.
+fn greeter_config(env: &Env, greeter: &[&str]) -> Config {
+    let mut c = env.config(vec![
+        ("nitro-server".to_owned(), server_args(env)),
+        (
+            "nitro-greeter".to_owned(),
+            shell_args(env, "nitro-greeter", greeter),
+        ),
+    ]);
+    c.pieces = nitro_session::pieces::GREETER_PIECES.to_vec();
+    c
+}
+
+/// The greeter's exit 0 is the hand-off: the whole tree goes, exit 0.
+#[test]
+fn a_greeter_that_exits_0_ends_the_session() {
+    let env = Env::new("greeter-handoff");
+    let mut session = Session::start(greeter_config(
+        &env,
+        &["--exit-after", "300", "--exit-code", "0"],
+    ))
+    .expect("starts");
+    let outcome = session.run(None);
+    assert_eq!(outcome, Outcome::Stopped);
+    assert_eq!(outcome.code(), 0);
+    assert_eq!(starts(&env, "nitro-greeter").len(), 1, "not restarted");
+    if sigterm_deliverable() {
+        assert!(
+            env.marks("nitro-server.marks")
+                .iter()
+                .any(|(w, _, _)| w == "term"),
+            "the server was stopped"
+        );
+    }
+}
+
+/// A greeter that crashes is restarted, and the session keeps running.
+#[test]
+fn a_crashed_greeter_is_restarted_and_the_session_stays() {
+    let env = Env::new("greeter-crash");
+    let mut session = Session::start(greeter_config(
+        &env,
+        &["--exit-after", "100", "--exit-code", "1"],
+    ))
+    .expect("starts");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        starts(&env, "nitro-greeter").len() >= 2
+    });
+    let status = request(&mut session, "status");
+    assert!(status.contains("nitro-server "), "{status}");
+    session.teardown();
+}

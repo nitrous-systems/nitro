@@ -1,0 +1,33 @@
+# greetd configuration for nitro (docs/greeter.md, deploy/greetd/README.md).
+# `just install-greetd` renders @BINDIR@ and @GREETER_USER@ and installs
+# this as /etc/greetd/config.toml; `just box-greetd` does the same on a
+# test box.
+
+[terminal]
+# The VT greetd owns. The greeter and every user session run on it.
+vt = 1
+
+[default_session]
+# The greeter: a nitro-server and nitro-greeter, as the greeter user.
+# Its exit 0 (after greetd's `start_session`) ends it; greetd then runs
+# the chosen session on the same VT.
+#
+# `systemd-cat` puts its log in the journal (identifier
+# `nitro-greeter-session`): greetd gives it the VT as stdio, which nobody
+# can read once the compositor has the screen.
+#
+# A greeter's server has no ~/.config/nitro/server.conf. For a keymap or
+# scale, point it at a system file:
+#   command = "env NITRO_CONFIG=/etc/nitro/server.conf systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
+#
+# Text fallback, for a box whose GPU or fonts are broken:
+#   command = "agreety --cmd @BINDIR@/nitro-session"
+command = "systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
+user = "@GREETER_USER@"
+
+# Decision 6: the owner boots straight into their own session, locked.
+# Once per boot, no authentication; the lock screen asks for the
+# password. After any logout, the greeter above.
+#[initial_session]
+#command = "@BINDIR@/nitro-session --locked"
+#user = "alice"

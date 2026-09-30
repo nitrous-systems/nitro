@@ -2,7 +2,9 @@
 //!
 //! # The order is start order, and teardown is its reverse
 //!
-//! `[server, lock screen, wallpaper, bar, launcher]`. The lock screen is
+//! `[server, lock screen, wallpaper, bar, launcher]` for the desktop,
+//! `[server, greeter]` for `nitro-session --greeter` ([`GREETER_PIECES`]).
+//! The lock screen is
 //! on demand ([`Role::Lock`]) and is not started with the desktop; its
 //! place in the order matters for `nitro-session --locked`, where it
 //! starts first after the server so it is the one that takes the lock,
@@ -93,6 +95,13 @@ pub enum Role {
     /// while the server keeps the session locked with no owner and the
     /// restarted lock screen takes it over.
     Lock,
+    /// The greeter (`nitro-session --greeter`, [`GREETER_PIECES`]). Exit
+    /// 0 means it handed off (greetd's `start_session` succeeded): the
+    /// session tears down and exits 0, so greetd can start the user's
+    /// session. Any other end is a crash, restarted with the shell
+    /// backoff and never given up: a greeter that cannot come back means
+    /// nobody can log in.
+    Primary,
 }
 
 /// One thing the session runs.
@@ -118,6 +127,18 @@ pub const LOCK_SCREEN: Piece = Piece {
 
 /// The lock screen's arguments.
 pub const LOCK_ARGS: &[&str] = &["--lock"];
+
+/// The greeter: `nitro-greeter` with no flag, greetd's greeter.
+pub const GREETER: Piece = Piece {
+    program: "nitro-greeter",
+    role: Role::Primary,
+};
+
+/// The `--greeter` profile: the server, then the greeter. No shell (the
+/// greeter paints its own background) and no lock slot (there is no
+/// session to lock). `NITRO_SESSION_PIECES` does not apply: it selects
+/// among the desktop's shell pieces.
+pub const GREETER_PIECES: &[Piece] = &[SERVER, GREETER];
 
 /// The server, the lock screen, the wallpaper, the bar, the launcher — in
 /// start order. The lock screen is on demand ([`Role::Lock`]): its slot
@@ -310,6 +331,17 @@ mod tests {
                 "nitro-server"
             ]
         );
+    }
+
+    /// The greeter profile: server first, greeter last out but one.
+    #[test]
+    fn the_greeter_profile_is_the_server_then_the_greeter() {
+        let names: Vec<_> = GREETER_PIECES.iter().map(|p| p.program).collect();
+        assert_eq!(names, vec!["nitro-server", "nitro-greeter"]);
+        assert_eq!(GREETER_PIECES[1].role, Role::Primary);
+        let down: Vec<_> = GREETER_PIECES.iter().rev().map(|p| p.program).collect();
+        assert_eq!(down, vec!["nitro-greeter", "nitro-server"]);
+        assert!(!GREETER_PIECES.iter().any(|p| p.role == Role::Lock));
     }
 
     /// A shell subset still gets the server first and the lock slot

@@ -1,9 +1,11 @@
 //! Turn the environment into a [`nitro_session::Config`] and run.
 //!
-//! `nitro-session [--locked]`. `--locked` starts the session locked: the
-//! server with `NITRO_LOCKED=1`, then the lock screen before the shell,
-//! so the desktop is never drawn before somebody has typed a password.
-//! Anything else on the command line is a usage error (exit 2).
+//! `nitro-session [--locked | --greeter]`. `--locked` starts the session
+//! locked: the server with `NITRO_LOCKED=1`, then the lock screen before
+//! the shell, so the desktop is never drawn before somebody has typed a
+//! password. `--greeter` is greetd's greeter session (`docs/greeter.md`):
+//! the server and `nitro-greeter`, and the greeter's exit 0 ends the
+//! session. Anything else on the command line is a usage error (exit 2).
 //!
 //! - `NITRO_SOCKET` / `NITRO_SHELL_SOCKET` name the sockets the session
 //!   waits for — the same variables the server binds and the clients
@@ -78,27 +80,50 @@ fn config_from_env() -> Config {
     config
 }
 
+/// Which profile the command line asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    Desktop,
+    Locked,
+    Greeter,
+}
+
+/// `None` is a usage error.
+fn parse_args(args: &[&str]) -> Option<Profile> {
+    match args {
+        [] => Some(Profile::Desktop),
+        ["--locked"] => Some(Profile::Locked),
+        ["--greeter"] => Some(Profile::Greeter),
+        _ => None,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let locked = match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => false,
-        ["--locked"] => true,
-        _ => {
-            eprintln!("usage: nitro-session [--locked]");
-            return ExitCode::from(2);
-        }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(profile) = parse_args(&args) else {
+        eprintln!("usage: nitro-session [--locked | --greeter]");
+        return ExitCode::from(2);
     };
     let mut config = config_from_env();
-    config.locked = locked;
+    match profile {
+        Profile::Desktop => {}
+        Profile::Locked => config.locked = true,
+        Profile::Greeter => {
+            if std::env::var_os("NITRO_SESSION_PIECES").is_some() {
+                warn!("NITRO_SESSION_PIECES is ignored by --greeter");
+            }
+            config.pieces = nitro_session::pieces::GREETER_PIECES.to_vec();
+        }
+    }
     info!(
         "nitro-session {} starting{}",
         env!("CARGO_PKG_VERSION"),
-        if locked { " locked" } else { "" }
+        match profile {
+            Profile::Desktop => "",
+            Profile::Locked => " locked",
+            Profile::Greeter => " as the greeter",
+        }
     );
     // Installed *before* the first child, so a SIGTERM during start-up
     // is queued rather than killing a supervisor that has a compositor
@@ -121,4 +146,19 @@ fn main() -> ExitCode {
     let outcome = session.run(Some(&mut signals));
     info!("session ended: {outcome:?}");
     ExitCode::from(outcome.code())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_line_is_one_profile_or_a_usage_error() {
+        assert_eq!(parse_args(&[]), Some(Profile::Desktop));
+        assert_eq!(parse_args(&["--locked"]), Some(Profile::Locked));
+        assert_eq!(parse_args(&["--greeter"]), Some(Profile::Greeter));
+        assert_eq!(parse_args(&["--locked", "--greeter"]), None);
+        assert_eq!(parse_args(&["--greeter", "--greeter"]), None);
+        assert_eq!(parse_args(&["--bogus"]), None);
+    }
 }

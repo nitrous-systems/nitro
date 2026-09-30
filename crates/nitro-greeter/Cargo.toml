@@ -1,6 +1,6 @@
 [package]
 name = "nitro-greeter"
-description = "The lock screen (and, later, greetd greeter): renders PAM's conversation as a nitro-ui app"
+description = "The lock screen and greetd greeter: renders PAM's conversation as a nitro-ui app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -19,7 +19,10 @@ nitro-system = { workspace = true }
 # The clock: `Zone`, `format_hm`, `ms_to_next_minute`. Reuse of a
 # workspace crate, not a new dependency (the files → launcher precedent).
 nitro-bar = { workspace = true }
-rustix = { workspace = true, features = ["fs", "time"] }
+# The `.desktop` reader, for `/usr/share/wayland-sessions`. Reuse of a
+# workspace crate (decision 4 in docs/greeter.md), not a new dependency.
+nitro-launcher = { workspace = true }
+rustix = { workspace = true, features = ["fs", "net", "time"] }
 
 [lib]
 name = "nitro_greeter"

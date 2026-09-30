@@ -1,10 +1,9 @@
-//! `nitro-greeter`: the lock screen, and later the greetd greeter.
+//! `nitro-greeter`: the lock screen, and greetd's greeter.
 //!
 //! One app, two backends (`docs/greeter.md`, decision 6). The screen
 //! renders PAM's conversation, whatever it asks, through the pure state
 //! machine in [`conv`]. It talks to an authenticator through [`backend`]:
-//! `nitro-auth` in lock mode, greetd in greeter mode (plan step 5, not
-//! built yet).
+//! `nitro-auth` in lock mode, greetd ([`greetd::Greetd`]) in greeter mode.
 //!
 //! ```text
 //! ┌──────────────────────────────┐
@@ -15,6 +14,8 @@
 //! │  Authentication failure      │  message  (notices and errors)
 //! │  Checking…                   │  status   (while waiting)
 //! │  [ Log out ]                 │  logout   (another user's name only)
+//! │  [ Nitro ]                   │  session  (greeter: click cycles)
+//! │  [Suspend][Restart][Power off]│  power   (greeter only)
 //! └──────────────────────────────┘
 //! ```
 //!
@@ -31,20 +32,34 @@
 //! A different name starts no conversation at all: another user never
 //! types a password into this session (decision 6). They are told to log
 //! out, and offered the button.
+//!
+//! **Greeter mode** (`nitro-greeter` with no flag, what `nitro-session
+//! --greeter` runs under greetd): the same window ([`Surface::lock`]:
+//! full output, focusable, and nothing else is on screen), no `Lock`.
+//! The remembered user is prefilled and asked for at once; otherwise the
+//! name field has the keyboard. After `success` the chosen session's
+//! command goes to greetd as `start_session`; its `success` saves the
+//! remembered user and session and exits 0, which ends the greeter's
+//! whole session so greetd can start the user's.
 
 pub mod backend;
 pub mod conv;
+pub mod greetd;
+pub mod sessions;
+pub mod state;
 
 use std::path::PathBuf;
 
 use nitro_bar::clock::{self, Zone};
 use nitro_login::{ErrorKind, MessageKind, Request};
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::widgets::{Label, TextField, button, column, label, panel, text_field};
+use nitro_ui::widgets::{Button, Label, TextField, button, column, label, panel, row, text_field};
 use nitro_ui::{App, ColorRole, CrossAlign, FdToken, MainAlign, Size, Surface, Ui, WidgetId};
 
 pub use backend::{AuthHelper, Backend};
 pub use conv::{Conversation, State};
+pub use sessions::SessionEntry;
+pub use state::Remembered;
 
 /// The app's name: its introspection socket and its `hey` address.
 pub const APP_NAME: &str = "nitro-greeter";
@@ -65,6 +80,15 @@ pub mod names {
     pub const STATUS: &str = "status";
     /// Log out, offered when someone else's name was typed.
     pub const LOGOUT: &str = "logout";
+    /// The session picker (greeter): its label is the session, a click
+    /// picks the next one.
+    pub const SESSION: &str = "session";
+    /// Suspend (greeter).
+    pub const SUSPEND: &str = "suspend";
+    /// Reboot (greeter).
+    pub const REBOOT: &str = "reboot";
+    /// Power off (greeter).
+    pub const POWEROFF: &str = "poweroff";
 }
 
 /// What the screen is for.
@@ -72,10 +96,15 @@ pub mod names {
 pub enum Mode {
     /// Unlock the owner's session: `nitro-auth`, `Lock`/`Unlock`.
     Lock,
+    /// greetd's greeter: log somebody in and start their session.
+    Greeter,
 }
 
 /// Said when the helper goes away mid-conversation.
 pub const HELPER_EXITED: &str = "authentication helper exited";
+
+/// Said when greetd's socket goes away mid-conversation.
+pub const GREETD_LOST: &str = "greetd connection lost";
 
 #[derive(Debug, Clone, Copy)]
 struct Ids {
@@ -86,6 +115,8 @@ struct Ids {
     message: WidgetId,
     status: WidgetId,
     logout: WidgetId,
+    session: WidgetId,
+    power: WidgetId,
 }
 
 /// The app's state.
@@ -103,6 +134,16 @@ pub struct Greeter {
     logout_error: Option<String>,
     session_socket: Option<PathBuf>,
     unlocked: bool,
+    /// Greeter: what can be started, and which is chosen.
+    sessions: Vec<SessionEntry>,
+    chosen: usize,
+    remembered: Remembered,
+    /// Greeter: greetd accepted the session; the app is quitting.
+    started: bool,
+    /// What a power button reported, if it failed.
+    power_error: Option<String>,
+    /// Where to remember the login; `None` (the tests) remembers nothing.
+    state_file: Option<PathBuf>,
 }
 
 impl Greeter {
@@ -122,7 +163,61 @@ impl Greeter {
             logout_error: None,
             session_socket: None,
             unlocked: false,
+            sessions: Vec::new(),
+            chosen: 0,
+            remembered: Remembered::default(),
+            started: false,
+            power_error: None,
+            state_file: None,
         }
+    }
+
+    /// greetd's greeter over `backend`, offering `sessions` (never
+    /// empty in practice: [`sessions::sessions`] puts nitro first), with
+    /// the last login's user and session as defaults.
+    #[must_use]
+    pub fn greeter(
+        backend: Box<dyn Backend>,
+        sessions: Vec<SessionEntry>,
+        remembered: Remembered,
+    ) -> Self {
+        let chosen = remembered
+            .session
+            .as_ref()
+            .and_then(|n| sessions.iter().position(|e| &e.name == n))
+            .unwrap_or(0);
+        let mut g = Self::lock(String::new(), backend);
+        g.mode = Mode::Greeter;
+        g.sessions = sessions;
+        g.chosen = chosen;
+        g.remembered = remembered;
+        g
+    }
+
+    /// Remember each login in `path` ([`state::save`]).
+    #[must_use]
+    pub fn with_state_file(mut self, path: PathBuf) -> Self {
+        self.state_file = Some(path);
+        self
+    }
+
+    /// The session that would be started (greeter).
+    #[must_use]
+    pub fn chosen_session(&self) -> Option<&SessionEntry> {
+        self.sessions.get(self.chosen)
+    }
+
+    /// Whether greetd accepted the session (the app is quitting).
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// What should be remembered now: the user and session of the
+    /// login greetd just accepted.
+    #[must_use]
+    pub fn remembered(&self) -> &Remembered {
+        &self.remembered
     }
 
     /// Use this `session.sock` for the logout button instead of the
@@ -220,6 +315,26 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .name(names::LOGOUT)
             .on_click(|s: &mut Greeter, ui: &mut Ui<Greeter>| logout(s, ui)),
     );
+    let session = ui.build(
+        button("")
+            .name(names::SESSION)
+            .on_click(|s: &mut Greeter, ui: &mut Ui<Greeter>| next_session(s, ui)),
+    );
+    let suspend = ui.build(button("Suspend").name(names::SUSPEND).on_click(
+        |s: &mut Greeter, ui: &mut Ui<Greeter>| power(s, ui, nitro_system::session::Action::Suspend),
+    ));
+    let reboot = ui.build(button("Restart").name(names::REBOOT).on_click(
+        |s: &mut Greeter, ui: &mut Ui<Greeter>| power(s, ui, nitro_system::session::Action::Reboot),
+    ));
+    let poweroff = ui.build(button("Power off").name(names::POWEROFF).on_click(
+        |s: &mut Greeter, ui: &mut Ui<Greeter>| {
+            power(s, ui, nitro_system::session::Action::Poweroff);
+        },
+    ));
+    let power_row = ui.build(row().gap(8.0).main_align(MainAlign::Center));
+    for c in [suspend, reboot, poweroff] {
+        ui.attach(power_row, c).unwrap();
+    }
     let card = ui.build(
         panel()
             .background_role(ColorRole::Surface)
@@ -229,7 +344,9 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .cross_align(CrossAlign::Center)
             .width(CARD_W),
     );
-    for c in [clock, user, prompt, answer, message, status, logout] {
+    for c in [
+        clock, user, prompt, answer, message, status, logout, session, power_row,
+    ] {
         ui.attach(card, c).unwrap();
     }
     let root = ui.build(
@@ -248,6 +365,8 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
         message,
         status,
         logout,
+        session,
+        power: power_row,
     };
     // The state is not reachable from `build`; the loop runs a zero
     // timer on its first turn, before the first frame is presented.
@@ -274,6 +393,22 @@ fn start(s: &mut Greeter, ui: &mut Ui<Greeter>) {
             }
             submit_user(s, ui, &owner);
         }
+        Mode::Greeter => {
+            // A crashed predecessor may have left greetd mid-conversation.
+            let reqs = s.conv.reset();
+            send_all(s, ui, reqs);
+            let user = s.remembered.user.clone().filter(|u| !u.is_empty());
+            if let Some(ids) = s.ids {
+                if let Ok(mut f) = ui.widget_mut::<TextField<Greeter>>(ids.user) {
+                    f.set_text(user.clone().unwrap_or_default());
+                }
+                ui.set_collapsed(ids.logout, true);
+            }
+            match user {
+                Some(u) => submit_user(s, ui, &u),
+                None => render(s, ui),
+            }
+        }
     }
 }
 
@@ -299,7 +434,7 @@ fn send_all(s: &mut Greeter, ui: &mut Ui<Greeter>, reqs: Vec<Request>) {
         }
         if let Err(e) = sent {
             unwatch(s, ui);
-            s.conv.lost(&format!("{HELPER_EXITED}: {e}"));
+            s.conv.lost(&format!("{}: {e}", lost_text(s)));
             return;
         }
     }
@@ -328,7 +463,7 @@ fn unwatch(s: &mut Greeter, ui: &mut Ui<Greeter>) {
 fn readable(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     let Ok(resps) = s.backend.read() else {
         unwatch(s, ui);
-        s.conv.lost(HELPER_EXITED);
+        s.conv.lost(lost_text(s));
         render(s, ui);
         return;
     };
@@ -343,8 +478,15 @@ fn readable(s: &mut Greeter, ui: &mut Ui<Greeter>) {
         on_response(s, ui, r);
     }
     if gone && s.backend.fd().is_none() && s.conv.busy() {
-        s.conv.lost(HELPER_EXITED);
+        s.conv.lost(lost_text(s));
         render(s, ui);
+    }
+}
+
+fn lost_text(s: &Greeter) -> &'static str {
+    match s.mode {
+        Mode::Lock => HELPER_EXITED,
+        Mode::Greeter => GREETD_LOST,
     }
 }
 
@@ -354,8 +496,18 @@ pub fn on_response(s: &mut Greeter, ui: &mut Ui<Greeter>, resp: nitro_login::Res
     let reqs = s.conv.on_response(resp);
     send_all(s, ui, reqs);
     match s.conv.state() {
-        State::Authenticated => {
+        State::Authenticated if s.mode == Mode::Lock => {
             unlock(s, ui);
+            return;
+        }
+        State::Authenticated => {
+            if let Some(e) = s.sessions.get(s.chosen).cloned() {
+                let reqs = s.conv.start_session(e.cmd.clone(), e.env());
+                send_all(s, ui, reqs);
+            }
+        }
+        State::Started => {
+            handed_off(s, ui);
             return;
         }
         // A wrong password: the reason is on screen, and the same name
@@ -369,10 +521,11 @@ pub fn on_response(s: &mut Greeter, ui: &mut Ui<Greeter>, resp: nitro_login::Res
                 .last_error()
                 .is_some_and(|e| e.0 == ErrorKind::AuthError)
                 && s.conv.answered()
-                && s.conv.username() == s.owner
+                && (s.mode == Mode::Greeter || s.conv.username() == s.owner)
                 && !s.conv.busy() =>
         {
-            let reqs = s.conv.submit_user(&s.owner.clone());
+            let name = s.conv.username().to_owned();
+            let reqs = s.conv.submit_user(&name);
             send_all(s, ui, reqs);
         }
         _ => {}
@@ -391,6 +544,10 @@ fn submit_user(s: &mut Greeter, ui: &mut Ui<Greeter>, name: &str) {
         return;
     }
     s.other_user = None;
+    if s.mode == Mode::Greeter && name.is_empty() {
+        render(s, ui);
+        return;
+    }
     let reqs = s.conv.submit_user(name);
     send_all(s, ui, reqs);
     render(s, ui);
@@ -420,6 +577,45 @@ fn unlock(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     ui.quit();
 }
 
+/// greetd accepted the session: remember the login, hang up, exit 0.
+fn handed_off(s: &mut Greeter, ui: &mut Ui<Greeter>) {
+    s.remembered = Remembered {
+        user: Some(s.conv.username().to_owned()),
+        session: s.sessions.get(s.chosen).map(|e| e.name.clone()),
+    };
+    if let Some(p) = &s.state_file {
+        state::save(p, &s.remembered);
+    }
+    unwatch(s, ui);
+    s.backend.close();
+    s.started = true;
+    ui.quit();
+}
+
+/// The session picker: the next one, round.
+fn next_session(s: &mut Greeter, ui: &mut Ui<Greeter>) {
+    if !s.sessions.is_empty() {
+        s.chosen = (s.chosen + 1) % s.sessions.len();
+    }
+    // The button is out of its slot during its own callback: relabel it
+    // on the deferred step.
+    ui.defer(render);
+}
+
+/// A power button: ask our own `nitro-session`.
+fn power(s: &mut Greeter, ui: &mut Ui<Greeter>, action: nitro_system::session::Action) {
+    let path = s
+        .session_socket
+        .clone()
+        .or_else(nitro_system::session::default_socket_path);
+    let res = match path {
+        Some(p) => nitro_system::session::request(&p, action),
+        None => Err("no session socket".to_owned()),
+    };
+    s.power_error = res.err();
+    render(s, ui);
+}
+
 fn logout(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     let path = s
         .session_socket
@@ -436,6 +632,9 @@ fn logout(s: &mut Greeter, ui: &mut Ui<Greeter>) {
 /// The message line: what is wrong, or what PAM said.
 fn message(s: &Greeter) -> (String, ColorRole) {
     if let Some(e) = &s.logout_error {
+        return (e.clone(), ColorRole::Danger);
+    }
+    if let Some(e) = &s.power_error {
         return (e.clone(), ColorRole::Danger);
     }
     if let Some(name) = &s.other_user {
@@ -486,6 +685,15 @@ fn render(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     }
     ui.set_collapsed(ids.status, *s.conv.state() != State::Waiting);
     ui.set_collapsed(ids.logout, s.other_user.is_none());
+    let greeter = s.mode == Mode::Greeter;
+    ui.set_collapsed(ids.session, !greeter);
+    ui.set_collapsed(ids.power, !greeter);
+    if greeter
+        && let Some(e) = s.sessions.get(s.chosen)
+        && let Ok(mut b) = ui.widget_mut::<Button<Greeter>>(ids.session)
+    {
+        b.set_text(e.name.clone());
+    }
     if prompting.is_some() {
         ui.focus(ids.answer);
     } else if *s.conv.state() == State::User {
@@ -493,7 +701,9 @@ fn render(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     }
 }
 
-/// The lock screen's shell surface.
+/// The shell surface, for both modes: an overlay covering the output,
+/// focusable. The greeter has nothing else on screen, so it needs no
+/// other kind of window.
 #[must_use]
 pub fn surface() -> Surface {
     Surface::lock()
@@ -512,5 +722,24 @@ pub fn run_lock() -> Result<(), Box<dyn std::error::Error>> {
         .surface(surface())
         .size(Size::new(640.0, 480.0))
         .run(Greeter::lock(owner, Box::new(helper)), build)?;
+    Ok(())
+}
+
+/// Run greeter mode: `nitro-greeter` under greetd. Returns once greetd
+/// accepted a session.
+///
+/// # Errors
+/// Not under greetd (`$GREETD_SOCK` unset), no shell socket, or a wire
+/// failure. `nitro-session --greeter` restarts the greeter on any of
+/// them.
+pub fn run_greeter() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = greetd::Greetd::from_env()?;
+    let greeter = Greeter::greeter(Box::new(backend), sessions::sessions(), state::load())
+        .with_state_file(state::path());
+    App::shell(APP_NAME)?
+        .title("nitro-greeter")
+        .surface(surface())
+        .size(Size::new(640.0, 480.0))
+        .run(greeter, build)?;
     Ok(())
 }

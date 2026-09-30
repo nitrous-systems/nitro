@@ -61,17 +61,18 @@ footprint secs="10":
 # Profiles:
 #   unit — box1. nitro runs as the `nitro-dev` system unit from
 #          ~/nitro-bin, and `deploy` restarts it.
-#   gdm  — testhost2. nitro is the human's GDM session
-#          (/usr/share/wayland-sessions/nitro.desktop →
-#          /usr/local/bin/nitro-session). Binaries go to /usr/local/bin
-#          through sudo; `deploy` does not restart anything, because GDM
-#          has no autologin and a restart drops to the greeter.
+#   greetd — testhost2. greetd is the display manager (`box-greetd`,
+#          docs/testbox.md "Login (greetd)"): nitro-greeter on tty1, and
+#          the human logs in to /usr/local/bin/nitro-session. Binaries go
+#          to /usr/local/bin through sudo; `deploy` does not restart
+#          anything, because a restart ends the logged-in session.
+# box1 (`unit`) runs greetd on tty1 as well, next to nitro-dev on tty2.
 # The profile is guessed from the host name and can be forced with
 # NITRO_BOX_PROFILE; NITRO_BOX_BINDIR overrides where the binaries are.
 # Both boxes keep their clone at ~/src/ai/nitro.
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-box_profile := env_var_or_default("NITRO_BOX_PROFILE", if box =~ '(^|@)(testhost2|192\.168\.1\.193)$' { "gdm" } else { "unit" })
-box_bindir := env_var_or_default("NITRO_BOX_BINDIR", if box_profile == "gdm" { "/usr/local/bin" } else { "~/nitro-bin" })
+box_profile := env_var_or_default("NITRO_BOX_PROFILE", if box =~ '(^|@)(testhost2|192\.168\.1\.193)$' { "greetd" } else { "unit" })
+box_bindir := env_var_or_default("NITRO_BOX_BINDIR", if box_profile == "greetd" { "/usr/local/bin" } else { "~/nitro-bin" })
 # Everything the box needs for a desktop. `nitro-session` is what the
 # unit runs; it finds the other four next to itself in ~/nitro-bin, which
 # is why they are deployed together and in one rsync — a session that
@@ -81,24 +82,24 @@ box_bins := "nitro-server nitro-gpu-vulkan nitro-session nitro-shot nitro-demo n
 box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session
-# (on a `gdm` box: install only; log out/in or `just box-restart`).
-[doc("Build release, deploy to the box and restart the session (gdm: install only)")]
+# (on a `greetd` box: install only; log out/in or `just box-restart`).
+[doc("Build release, deploy to the box and restart the session (greetd: install only)")]
 [group('dev')]
 deploy: (deploy-bins)
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ {{box_profile}} == gdm ]]; then
+    if [[ {{box_profile}} == greetd ]]; then
         echo "installed on {{box}}; log out and in (or \`just box={{box}} box-restart\`) to pick it up"
     else
         ssh {{box}} 'sudo systemctl restart nitro-dev' && just box={{box}} box-status
     fi
 
-# Restart the box's session. On a `gdm` box this restarts GDM, which
-# ends the logged-in session and leaves the greeter.
-[doc("Restart the box session (gdm box: restarts GDM, back to the greeter)")]
+# Restart the box's session. On a `greetd` box this restarts greetd,
+# which ends the logged-in session and leaves the greeter.
+[doc("Restart the box session (greetd box: restarts greetd, back to the greeter)")]
 [group('dev')]
 box-restart:
-    ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl restart gdm'" } else { "'sudo systemctl restart nitro-dev'" } }}
+    ssh {{box}} {{ if box_profile == "greetd" { "'sudo systemctl restart greetd'" } else { "'sudo systemctl restart nitro-dev'" } }}
 
 [doc("Build release and copy binaries + launcher entries to the box")]
 [group('dev')]
@@ -177,7 +178,7 @@ _deploy-pam:
 # examples (probes, not part of the session) go to ~/nitro-bin. The
 # .desktop entries go last into /usr/local/share/applications, for the
 # reason spelled out above.
-_deploy-bins-gdm:
+_deploy-bins-greetd:
     ssh {{box}} 'mkdir -p ~/nitro-stage ~/nitro-bin'
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-stage/
     cd target/release/examples && rsync -az {{box_examples}} planes_probe {{box}}:nitro-bin/
@@ -209,8 +210,8 @@ deploy-chromium:
     # `chrome` links ATK/AT-SPI (accessibility) and a desktop-less box
     # does not have them: without these three it dies in the loader with
     # `libatk-1.0.so.0: cannot open shared object file`. Idempotent.
-    # On the Arch box (`gdm` profile) the same libraries are `at-spi2-core`.
-    if [[ {{box_profile}} == gdm ]]; then
+    # On the Arch box (`greetd` profile) the same libraries are `at-spi2-core`.
+    if [[ {{box_profile}} == greetd ]]; then
         ssh {{box}} 'pacman -Q at-spi2-core >/dev/null 2>&1 || sudo pacman -S --needed --noconfirm at-spi2-core'
     else
         ssh {{box}} 'dpkg -s libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64'
@@ -287,15 +288,15 @@ chromium-clipboard:
     ssh {{box}} 'bash ~/nitro-stage/chromium-clipboard.sh'
 
 # Install/refresh the systemd unit on the box (needs sudo there). On a
-# `gdm` box there is no unit (it would fight GDM for tty2): this makes
-# the clone pushable and checks the GDM session entry instead.
-[doc("Install/refresh the nitro-dev systemd unit on the box (gdm: check setup)")]
+# `greetd` box there is no unit: this makes the clone pushable and
+# checks that greetd is the display manager (`box-greetd` sets it up).
+[doc("Install/refresh the nitro-dev systemd unit on the box (greetd: check setup)")]
 [group('dev')]
 box-install:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ {{box_profile}} == gdm ]]; then
-        ssh {{box}} 'git -C ~/src/ai/nitro config receive.denyCurrentBranch updateInstead && test -f /usr/share/wayland-sessions/nitro.desktop && echo "GDM session entry present"'
+    if [[ {{box_profile}} == greetd ]]; then
+        ssh {{box}} 'git -C ~/src/ai/nitro config receive.denyCurrentBranch updateInstead && systemctl is-enabled greetd && echo "greetd is the display manager"'
         exit
     fi
     # `daemon-reload` picks up a changed unit; disabling getty@tty2 frees
@@ -306,7 +307,53 @@ box-install:
 [doc("Show the status of nitro on the box")]
 [group('dev')]
 box-status:
-    ssh {{box}} {{ if box_profile == "gdm" { "'loginctl list-sessions --no-pager; pgrep -a nitro || echo no nitro processes; systemctl is-active gdm || true'" } else { "'systemctl status nitro-dev --no-pager -n 20 || true'" } }}
+    ssh {{box}} {{ if box_profile == "greetd" { "'loginctl list-sessions --no-pager; pgrep -a nitro || echo no nitro processes; systemctl is-active greetd || true'" } else { "'systemctl status nitro-dev --no-pager -n 20 || true'" } }}
+
+# greetd as the box's display manager (docs/testbox.md "Login (greetd)").
+# Idempotent. Installs the package, renders deploy/greetd/config.toml
+# with the box's bin dir and greeter user (`greeter` on Arch, `_greetd`
+# on Debian/Ubuntu), backs up the original config once as
+# config.toml.pre-nitro, and switches the display manager: gdm is
+# disabled and stopped if present, greetd enabled and started. On box1
+# the greeter runs ~/nitro-bin, so the greeter user gets an ACL `x` on
+# the home directory to reach it. Undo with `box-greetd-rollback`.
+[doc("Install greetd on the box and make it the display manager (drops gdm)")]
+[group('dev')]
+box-greetd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh {{box}} 'command -v greetd >/dev/null || { if command -v pacman >/dev/null; then sudo pacman -S --needed --noconfirm greetd; else sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends greetd; fi; }'
+    greeter=$(ssh {{box}} 'getent passwd greeter >/dev/null && echo greeter || echo _greetd')
+    bindir=$(ssh {{box}} 'echo {{box_bindir}}')
+    mkdir -p tmp
+    sed -e "s|@BINDIR@|$bindir|g" -e "s|@GREETER_USER@|$greeter|g" deploy/greetd/config.toml > tmp/greetd-config.toml
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az tmp/greetd-config.toml {{box}}:nitro-stage/greetd-config.toml
+    ssh {{box}} "set -e
+        test -e /etc/greetd/config.toml.pre-nitro || sudo cp -a /etc/greetd/config.toml /etc/greetd/config.toml.pre-nitro
+        sudo install -m 644 ~/nitro-stage/greetd-config.toml /etc/greetd/config.toml
+        sudo install -d -o $greeter -m 755 /var/cache/nitro-greeter
+        case $bindir in /home/*)
+            command -v setfacl >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl
+            sudo setfacl -m u:$greeter:x \$HOME ;;
+        esac
+        if systemctl cat gdm >/dev/null 2>&1; then sudo systemctl disable gdm 2>/dev/null || true; sudo systemctl stop gdm || true; fi
+        # Debian's unit conflicts with getty@tty7 only (its default
+        # VT); ours is VT 1, so the tty1 getty must yield to it.
+        sudo install -d /etc/systemd/system/greetd.service.d
+        printf '[Unit]\\nConflicts=getty@tty1.service\\nAfter=getty@tty1.service\\n' | sudo tee /etc/systemd/system/greetd.service.d/nitro-vt1.conf >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl disable getty@tty1 2>/dev/null || true
+        sudo systemctl enable greetd
+        sudo systemctl restart greetd
+        sleep 2; systemctl is-active greetd"
+
+# Undo `box-greetd`: greetd off, the original config back, and gdm (or
+# the tty1 getty) back on.
+[doc("Undo box-greetd: disable greetd, restore gdm or getty@tty1")]
+[group('dev')]
+box-greetd-rollback:
+    ssh {{box}} 'set -e; sudo systemctl disable --now greetd; sudo rm -f /etc/systemd/system/greetd.service.d/nitro-vt1.conf; sudo systemctl daemon-reload; sudo systemctl enable getty@tty1 2>/dev/null || true; if test -e /etc/greetd/config.toml.pre-nitro; then sudo mv /etc/greetd/config.toml.pre-nitro /etc/greetd/config.toml; fi; if systemctl cat gdm >/dev/null 2>&1; then sudo systemctl enable --now gdm; else sudo systemctl start getty@tty1; fi'
 
 # Talk to the running session: `status`, `lock`, `suspend`, `logout`.
 [doc("Send a command to the running session: status, lock, suspend, logout")]
@@ -325,14 +372,14 @@ box-ps:
 [doc("Follow the box's nitro logs (journalctl -f)")]
 [group('dev')]
 box-log:
-    ssh {{box}} {{ if box_profile == "gdm" { "'journalctl -f -o cat _COMM=nitro-server + _COMM=nitro-session + _COMM=nitro-bar + _COMM=nitro-launcher + _COMM=nitro-wallpaper'" } else { "'journalctl -u nitro-dev -f -o cat'" } }}
+    ssh {{box}} {{ if box_profile == "greetd" { "'journalctl -f -o cat _COMM=nitro-server + _COMM=nitro-session + _COMM=nitro-greeter + _COMM=nitro-bar + _COMM=nitro-launcher + _COMM=nitro-wallpaper + _COMM=greetd'" } else { "'journalctl -u nitro-dev -f -o cat'" } }}
 
-# On a `gdm` box this stops GDM (the human's standing OK; start it again
-# with `just box=testhost2 box-restart`).
-[doc("Stop nitro on the box (gdm box: stops GDM)")]
+# On a `greetd` box this stops greetd (the human's standing OK; start it
+# again with `just box=testhost2 box-restart`).
+[doc("Stop nitro on the box (greetd box: stops greetd)")]
 [group('dev')]
 box-stop:
-    ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl stop gdm'" } else { "'sudo systemctl stop nitro-dev'" } }}
+    ssh {{box}} {{ if box_profile == "greetd" { "'sudo systemctl stop greetd'" } else { "'sudo systemctl stop nitro-dev'" } }}
 
 # Screenshot of the live server, written to tmp/shot.png.
 [doc("Screenshot the live server on the box into tmp/shot.png")]
@@ -415,12 +462,12 @@ box-push:
 # and unrunnable since `c4f51f1`. `crates/nitro-bench/tests/bench_recipe.rs`
 # pins it.
 #
-# A `gdm` box has no nitro-dev unit to restart between arms, so bench
+# A `greetd` box has no nitro-dev unit to restart between arms, so bench
 # refuses there.
 [doc("Run the throughput benchmark matrix on the box (restarts nitro-dev)")]
 [group('dev')]
 bench modes="" seconds="10":
-    {{ if box_profile == "gdm" { "echo 'bench: " + box + " runs nitro under GDM, with no nitro-dev unit to restart between arms (docs/testbox.md)' >&2; exit 1" } else { "" } }}
+    {{ if box_profile == "greetd" { "echo 'bench: " + box + " runs nitro under greetd, with no nitro-dev unit to restart between arms (docs/testbox.md)' >&2; exit 1" } else { "" } }}
     ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes " + quote(quote(modes)) } }} < deploy/bench.sh
     mkdir -p tmp/bench
     ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl

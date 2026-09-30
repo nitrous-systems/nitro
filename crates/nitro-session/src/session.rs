@@ -12,6 +12,8 @@
 //!    │
 //!    ├─ a shell piece exited  ──▶ schedule a restart (backoff)
 //!    ├─ the lock screen exited ─▶ 0: unlocked, done; else restart it
+//!    ├─ the greeter exited    ──▶ 0: handed off, tear down, exit 0;
+//!    │                            else restart it
 //!    ├─ the server exited     ──▶ tear down, exit with its code
 //!    ├─ a command arrived     ──▶ lock/suspend/poweroff/reboot/logout/status
 //!    ├─ a restart is due      ──▶ start the piece again
@@ -591,6 +593,17 @@ impl Session {
                 uptime.as_secs_f32()
             );
             self.slots[idx].backoff = self.config.backoff;
+            return;
+        }
+
+        if self.slots[idx].piece.role == Role::Primary && exit == Exit::Code(0) {
+            // The greeter handed off: greetd starts the user's session
+            // once this whole tree is gone, so it goes.
+            info!(
+                "{program} (pid {pid}) handed off after {:.1}s — ending the session",
+                uptime.as_secs_f32()
+            );
+            self.stopping = Some(Outcome::Stopped);
             return;
         }
 
