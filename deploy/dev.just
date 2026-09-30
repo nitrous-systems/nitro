@@ -250,16 +250,17 @@ deploy-chromium:
 
 # Chromium scroll/i2p/memory benchmark on the box (#3919), against the
 # running session: `just chromium-bench oop`, `just box=testhost2
-# chromium-bench inproc 3`. MODE is inproc | oop | gpu | dmabuf | shm (see
-# the script; `dmabuf` is #3921's GPU path, `NITRO_BENCH_ANGLE=gl` on the box
-# switches its ANGLE backend).
+# chromium-bench inproc 3`. MODE is inproc | oop | gpu | dmabuf | shm | video
+# (see the script; `dmabuf` is #3921's GPU path, `NITRO_BENCH_ANGLE=gl` on the
+# box switches its ANGLE backend; `video` plays an H.264 clip for #3944's
+# overlays, steered by NITRO_NO_OVERLAYS and NITRO_BENCH_{RES,FPS,VIDEO_FS,VIDEO_CSS}).
 # Needs `deploy-chromium` first; leaves nothing behind but /tmp files.
-[doc("Chromium scroll/i2p/memory benchmark on the box (mode: inproc|oop|gpu|dmabuf|shm)")]
+[doc("Chromium scroll/i2p/memory benchmark on the box (mode: inproc|oop|gpu|dmabuf|shm|video)")]
 [group('dev')]
 chromium-bench mode="oop" runs="2":
     ssh {{box}} 'mkdir -p ~/nitro-stage'
     rsync -az deploy/chromium-bench.sh deploy/scroll-bench.py {{box}}:nitro-stage/
-    ssh {{box}} "NITRO_BENCH_ANGLE=${NITRO_BENCH_ANGLE:-vulkan} bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}"
+    ssh {{box}} "NITRO_BENCH_ANGLE=${NITRO_BENCH_ANGLE:-vulkan} NITRO_NO_OVERLAYS=${NITRO_NO_OVERLAYS:-0} NITRO_BENCH_RES=${NITRO_BENCH_RES:-1080} NITRO_BENCH_FPS=${NITRO_BENCH_FPS:-60} NITRO_BENCH_VIDEO_FS=${NITRO_BENCH_VIDEO_FS:-0} NITRO_BENCH_VIDEO_CSS=${NITRO_BENCH_VIDEO_CSS:-1280x720} bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}"
 
 # Chromium clipboard end to end on the box (#3943): two browsers,
 # nitro-term and nitro-files copy and paste to each other through the DATA
