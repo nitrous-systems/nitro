@@ -299,6 +299,21 @@ chromium-dnd:
     rsync -az deploy/chromium-dnd.sh {{box}}:nitro-stage/
     ssh {{box}} 'bash ~/nitro-stage/chromium-dnd.sh'
 
+# Chromium full-screen sharing end to end on the box (#676 D):
+# getDisplayMedia + RTCPeerConnection loopback while a video plays and a
+# GPU Chromium window is open; prints the received fps and a content
+# check, display fps sharing off vs on, CPU, the server's capture counters
+# and dma-buf memory while recording and after (see the script). Needs
+# `deploy-chromium` and a session whose server grants capture
+# (NITRO_CAPTURE_ALLOW=1 until the prompt of #676 C). `just chromium-share
+# 30 60` shares for 30 s at 60 fps; KEEP=1 on the box keeps the logs.
+[doc("Chromium screen sharing (getDisplayMedia) end to end on the box: PASS/FAIL + measurements")]
+[group('dev')]
+chromium-share secs="20" fps="30":
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az deploy/chromium-share.sh deploy/scroll-bench.py {{box}}:nitro-stage/
+    ssh {{box}} "KEEP=${KEEP:-} NITRO_SHOT=${NITRO_SHOT:-} bash ~/nitro-stage/chromium-share.sh {{secs}} {{fps}}"
+
 # Install/refresh the systemd unit on the box (needs sudo there). On a
 # `greetd` box there is no unit: this makes the clone pushable and
 # checks that greetd is the display manager (`box-greetd` sets it up).

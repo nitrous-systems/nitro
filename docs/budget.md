@@ -2031,8 +2031,67 @@ Server/helper CPU is `/proc/<pid>/stat` utime+stime over the 5.5 s run.
   24 883 200 while recording, 0 after.
 - **Not measured:** 2560×1440 — box1's monitor has no such mode and
   testhost2 was held for manual use during this task; the 2160p run is the
-  stricter case for the display-fps question. testhost2 (anv) numbers and
-  the Chromium path belong to #676 D.
+  stricter case for the display-fps question. testhost2 (anv, 1440p)
+  numbers and the Chromium path: § Chromium screen sharing below.
+
+### Chromium screen sharing (#676 D)
+
+`just chromium-share [SECS] [FPS]` (deploy/chromium-share.sh), 2026-09-30,
+Chromium `nitro-ozone` `d2ba75f912`, nitro `task-3964` + this change,
+server with `NITRO_CAPTURE_ALLOW=1` (a runtime drop-in on box1's
+`nitro-dev`; on testhost2 the temporary `nitro-dev` unit of testbox.md,
+greetd restored afterwards). Load in all three windows: `nitro-video
+--synthetic` (720p30, helper-composited: `planes_mode 2`, 0 planes in
+use) and a GPU (ANGLE-Vulkan) Chromium window with a canvas redrawn
+every frame. Windows of 20 s: **off**, **recording** (the server records
+to `nitro-shot --record`, which only maps and releases slots) and
+**sharing** (getDisplayMedia → RTCPeerConnection loopback → canvas).
+CPU is % of one core over the window.
+
+| box, output | asked | display fps off / recording | server CPU off / rec | helper CPU | capture fps (server) | received fps (page) | Chromium CPU sharing | capture GPU µs mean / max |
+|---|---|---|---|---|---|---|---|---|
+| testhost2 eDP 2560×1440@60, scale 1.5 | 30 | 29.8 / 29.8 | 62 % / 73 % | 1.3–1.5 % | 29.7 | 17.4 | 225 % | 4 614 / 11 330 |
+| testhost2 | 60 | 29.9 / 30.0 | 62 % / 78 % | 1.3–1.8 % | 30.0 (display-bound) | 18.6 | 327 % | 4 107 / 9 354 |
+| box1 HDMI 1920×1080@60 | 30 | 33.1 / 59.6 | 38 % / 35 % | 1.9–3.4 % | 30.0 | 10.0 | 160 % | 10 645 / 87 309 |
+| box1 | 60 | 31.4 / 59.9 | 40 % / 41 % | 1.8–4.7 % | 59.7 | 9.3 | 167 % | 9 250 / 21 424 |
+
+- **Display fps does not drop while recording.** Under the same load,
+  off vs recording is equal on testhost2 and higher on box1 (the "off"
+  window there runs at 31–33 fps and the recording window at 60 in every
+  run; the load's frame rate on box1 varies between windows, so this is
+  not a speedup from recording, only no loss). With Chromium as the
+  consumer the display rate moves with the browser: its software VP8
+  encode (160–330 % CPU) competes with the page's own raster.
+- **Capture fps** is what the server sends (`capture_frames`); the page's
+  **received fps** is bounded by the loopback's software encode: 8–10 fps
+  at 1080p on box1's 2-core Pentium, 15–21 at 1440p on testhost2. The
+  capturer itself kept up: 24–28 fps delivered to WebRTC on both boxes at
+  30 asked (`nitro-capture: fps` VLOG line), with the rest released
+  unread (`skipped`, the newest completed frame wins).
+- **Chromium's copy** (mapped LINEAR slot → the WebRTC frame, damage
+  rects only): 2.3–2.7 ms per frame at 1440p on testhost2 (1.7–2.5 Mpx
+  copied per frame), 3.9–5.4 ms at 1080p on box1 (~1 Mpx). The server's
+  snapshot copy (`capture_copy_us`) is 2.3–2.9 ms (testhost2) and
+  4.6–6.4 ms (box1) under this load.
+- **Latency** (flip → copied into the WebRTC frame, sampled every 5 s):
+  12–49 ms on testhost2, 19–81 ms on box1: up to one capture interval of
+  waiting for the capture thread's next `CaptureFrame()`, plus the fence.
+  `nitro-shot --record` alone sees 13–14 ms flip → fence on box1
+  (§ Screen recording above).
+- **Drops** (`capture_drops`, no free slot at a flip): 0 on testhost2;
+  on box1 112–130 over ~5 000 frames, when the capture thread was late
+  on a busy 2-core CPU.
+- **Memory.** Ring 3 × w×h×4 (43.2 MB at 1440p, 24.3 MB at 1080p) plus
+  the server's snapshot (14.7 / 8.3 MB) while sharing
+  (`capture_rings_bytes`, `capture_snapshot_bytes`). Chromium's side is
+  one w×h×4 frame (14.7 / 8.3 MB), a second one only while WebRTC still
+  holds the previous. dma-buf bufinfo went from the idle baseline (4
+  objects: the helper's output ring on this load) to 15–22 objects while
+  sharing (the capture ring, the snapshot's udmabuf, the video's and the
+  GPU window's buffers) and back to the baseline once the browser closed;
+  `capture_rings_bytes` and `capture_snapshot_bytes` 0 after.
+- **Idle cost: zero.** Nothing is allocated until a page calls
+  getDisplayMedia; the picker lists outputs by name without capturing.
 
 ## Dependency count
 
