@@ -162,13 +162,16 @@ for run in $(seq 1 "$runs"); do
     g_pss=0; g_rss=0
     [[ -n $gpu ]] && { g_pss=$(pss "$gpu"); g_rss=$(rss "$gpu"); }
     s0="$(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints)"
-    j0=$(tree_jiffies); t0=$(date +%s.%N)
+    srv=$(pgrep -x nitro-server | head -1 || true)
+    sj() { [[ -n $srv ]] && awk '{print $14+$15}' "/proc/$srv/stat" 2>/dev/null || echo 0; }
+    j0=$(tree_jiffies); s_j0=$(sj); t0=$(date +%s.%N)
     row=$(python3 "$here/scroll-bench.py" --label "$mode #$run" 2>&1 | tail -3)
-    j1=$(tree_jiffies); t1=$(date +%s.%N)
+    j1=$(tree_jiffies); s_j1=$(sj); t1=$(date +%s.%N)
     cpu=$(python3 -c "print(round(($j1-$j0)/$(getconf CLK_TCK)/($t1-$t0)*100))")
+    scpu=$(python3 -c "print(round(($s_j1-$s_j0)/$(getconf CLK_TCK)/($t1-$t0)*100))")
     echo "$row"
-    echo "  server: dmabuf_buffers/fence_waits/placeholder_paints before $s0, after $(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints); planes_mode $(stat planes_mode), gpu_frames $(stat gpu_frames)"
-    echo "  mem idle: browser PSS $((b_pss/1024)) MB (RSS $((b_rss/1024))), gpu PSS $((g_pss/1024)) MB (RSS $((g_rss/1024))), tree PSS $((tree_pss/1024)) MB; chrome CPU over scroll ${cpu}% of one core"
+    echo "  server: dmabuf_buffers/fence_waits/placeholder_paints before $s0, after $(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints); planes_mode $(stat planes_mode), gpu_frames $(stat gpu_frames), gpu_translucent_approx $(stat gpu_translucent_approx)"
+    echo "  mem idle: browser PSS $((b_pss/1024)) MB (RSS $((b_rss/1024))), gpu PSS $((g_pss/1024)) MB (RSS $((g_rss/1024))), tree PSS $((tree_pss/1024)) MB; chrome CPU over scroll ${cpu}% of one core, nitro-server ${scpu}%"
     grep -m6 -E "NITRO_GPU|nitro: GBM|dma-buf|GPU raster|the server lacks|FATAL|GPU process has crashed|GL_RENDERER|ANGLE" "$prof/log" | cut -c1-200 | sed 's/^/  log: /' || true
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
