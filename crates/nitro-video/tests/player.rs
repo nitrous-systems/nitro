@@ -6,7 +6,7 @@ use std::path::Path;
 
 use nitro_ui::Size;
 use nitro_ui::test::Harness;
-use nitro_video::decode::{Decoder, HwDec, Matrix, Nv12Layout, Output, SyntheticDecoder};
+use nitro_video::decode::{HwDec, Matrix, Nv12Layout, Output, SyntheticDecoder, VideoSource};
 use nitro_video::ffmpeg::LibavDecoder;
 use nitro_video::player::{self, HIDE_MS, Opts, Player, State};
 use nitro_wire::types::{WindowState, modifier};
@@ -285,7 +285,7 @@ fn auto_swaps_a_tiled_hw_decoder_for_software() {
     let info = dec.info().clone();
     let mut p = Player::new(Box::new(dec), Opts::default()).expect("player");
     p.set_software(Box::new(|| {
-        Ok(Box::new(SyntheticDecoder::new(64, 36, 30, 3000)) as Box<dyn Decoder>)
+        Ok(Box::new(SyntheticDecoder::new(64, 36, 30, 3000)) as Box<dyn VideoSource>)
     }));
     let wake = rustix::io::dup(p.wake_fd()).expect("dup");
     let mut h = Harness::sized("nitro-video", p, Size::new(256.0, 144.0), move |ui| {

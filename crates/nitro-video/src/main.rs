@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use nitro_ui::{App, Size};
-use nitro_video::decode::{Decoder, HwDec, SyntheticDecoder};
+use nitro_video::decode::{HwDec, SyntheticDecoder, VideoSource};
 use nitro_video::ffmpeg;
 use nitro_video::player::{self, Opts, Player};
 
@@ -92,7 +92,7 @@ fn main() -> ExitCode {
         }
     };
     let mut fallback = None;
-    let dec: Box<dyn Decoder> = match &args.file {
+    let dec: Box<dyn VideoSource> = match &args.file {
         Some(f) if !args.synthetic => {
             match ffmpeg::open(f, args.opts.hwdec, &args.device, decode_threads()) {
                 Ok(o) => {
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
             if let Some(f) = args.file.clone().filter(|_| !args.synthetic) {
                 p.set_software(Box::new(move || {
                     ffmpeg::LibavDecoder::open(&f, decode_threads())
-                        .map(|d| Box::new(d) as Box<dyn Decoder>)
+                        .map(|d| Box::new(d) as Box<dyn VideoSource>)
                 }));
             }
             p

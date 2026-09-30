@@ -31,6 +31,7 @@ nitro-kms    = { path = "crates/nitro-kms" }
 nitro-shm    = { path = "crates/nitro-shm" }
 nitro-fs     = { path = "crates/nitro-fs" }
 nitro-gpu    = { path = "crates/nitro-gpu" }
+nitro-media  = { path = "crates/nitro-media" }
 nitro-login  = { path = "crates/nitro-login" }
 rustix       = { version = "1", default-features = false, features = ["std"] }
 drm          = "0.15"

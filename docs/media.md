@@ -1,6 +1,7 @@
 # `nitro-media`: nodes, out-of-process decode, PipeWire
 
-Status: **design sketch**, nothing built. Research behind it:
+Status: **phase 1 built** (#3988): `crates/nitro-media` (library only);
+phases 2–5 are design. Research behind it:
 [`research/media-kit.md`](research/media-kit.md) (the BeOS Media Kit, and
 how PipeWire maps onto it).
 
@@ -240,6 +241,12 @@ message.
    the node vocabulary, the `Source` trait, `SyntheticDecoder` as the
    fake, and the protocol + validation. `nitro-video` depends on it and
    still runs FFmpeg in-process behind the trait. No behaviour change.
+   **Done (#3988).** The trait is `VideoSource` (today's decoder seam
+   plus `set_mode`; the generation-carrying `seek`/`next` arrive with the
+   remote source). `SyntheticDecoder` is a plain module, not a
+   `test-support` feature, because `nitro-video --synthetic` ships it.
+   Presentation policy (`choose_output`, `scale_target`, the ring,
+   pacing) stays in `nitro-video`.
 2. **Helper, video.** Create `crates/nitro-media-helper` (`shim.c`,
    `build.rs`, `ffmpeg.rs` move here), a remote source, and the per-app
    helper pool (warm, reuse after `Closed`, kill on failure).

@@ -27,7 +27,7 @@
 //! hwaccel for the codec, a profile the driver lacks, not 8-bit 4:2:0) is
 //! a fallback reason, and the file is opened again in software.
 //!
-//! No `FFmpeg` type leaves this file: the player sees a [`Decoder`].
+//! No `FFmpeg` type leaves this file: the player sees a [`VideoSource`].
 
 #![allow(unsafe_code)] // The FFI exception; listed in DEPENDENCIES.md.
 
@@ -37,7 +37,8 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::decode::{
-    Decoder, DmabufDesc, DmabufFrame, DmabufPlane, HwDec, HwInfo, Matrix, Nv12Layout, StreamInfo,
+    DmabufDesc, DmabufFrame, DmabufPlane, HwDec, HwInfo, Matrix, Nv12Layout, StreamInfo,
+    VideoSource,
 };
 
 /// The shim's opaque context.
@@ -311,7 +312,7 @@ impl LibavDecoder {
     }
 }
 
-impl Decoder for LibavDecoder {
+impl VideoSource for LibavDecoder {
     fn info(&self) -> &StreamInfo {
         &self.info
     }

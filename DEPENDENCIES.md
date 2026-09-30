@@ -588,10 +588,13 @@ reasons, decided by the project's human over the `ffmpeg` child process
 that `nitro-amp` uses:
 
 - FFmpeg is the mature container and codec stack (MP4, MKV/WebM, H.264,
-  HEVC, VP9, AV1 where built), and a later **`nitro-media`** crate will
-  own media streams and graph handling on top of it. The backend lives in
-  `ffmpeg.rs` + `shim.c` behind the `Decoder` trait, with no FFmpeg type
-  outside those two files, so it moves there without touching the player.
+  HEVC, VP9, AV1 where built), and the **`nitro-media`** crate owns media
+  streams and graph handling on top of it (`docs/media.md`). Since #3988
+  the `VideoSource` trait, the frame types and the synthetic source live
+  in `nitro-media` (no C, no `unsafe`); the backend still lives in
+  nitro-video's `ffmpeg.rs` + `shim.c` behind that trait, with no FFmpeg
+  type outside those two files, and moves into the helper in phase 2
+  without touching the player.
 - Its VA-API hwaccel (`AV_HWDEVICE_TYPE_VAAPI` + DRM PRIME export) is the
   route to the hardware-decode follow-up (#3903's recommendation).
 - **Rejected: `openh264`** (measured while planning): mis-decoded x264
@@ -652,6 +655,7 @@ the syscall families it uses.
 | `nitro-fs` | `fs`, `pipe`, `event` | `pipe` for the background scan's doorbell descriptor and `fcntl` to make it non-blocking; `poll` in the scan's own tests; `mknodat` for the fifo test |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
 | `nitro-video` | `pipe`, `time` | `pipe2(O_NONBLOCK)` for the decode thread's wake descriptor; `clock_gettime` for frame pacing |
+| `nitro-media` | `fs` | `lseek` to size memfds and dma-bufs when validating helper replies; `dup` (no feature flag) for the synthetic source's plane fds. Already enabled by `nitro-shm`, so nothing unifies into a binary |
 | `nitro-gpu` | `event`, `fs`, `process`, `pipe`, `stdio` | `poll` over the socket and in-flight sync_files; `memfd`/`fstat`/`open`; `setrlimit`, `chdir`, `set_dumpable_behavior` for the sandbox; `pipe` for the fake backend's fences; `dup2_stdin` to take the socket off fd 0. **No feature new to the workspace**, deliberately: `thread` (for `set_no_new_privs`) unified into every binary and changed their bytes (measured, #3920), so it waits for the seccomp step |
 | `nitro-gpu-vulkan` | `fs`, `param` | `open`/`stat`/`major`/`minor` for the render node and ICD lookup; `page_size` (udmabuf wants page-aligned sizes); `ioctl` (no feature flag) for `UDMABUF_CREATE` and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` |
 | `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |

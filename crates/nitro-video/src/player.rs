@@ -2,7 +2,7 @@
 //!
 //! # Threads
 //!
-//! Decoding runs on its own thread, which owns the [`Decoder`] and maps
+//! Decoding runs on its own thread, which owns the [`VideoSource`] and maps
 //! the ring's memfds itself; the UI thread never touches a pixel. The two
 //! talk over channels ([`Cmd`] down, [`Msg`] up) plus a wake pipe the UI
 //! loop watches with [`Ui::add_fd`], so a finished frame wakes the app
@@ -57,8 +57,8 @@ use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, NodeId, WindowState, 
 
 use crate::controls::{self, ICON_PAUSE, ICON_PLAY, Ids};
 use crate::decode::{
-    Decoder, DmabufDesc, FrameBuf, HwDec, HwInfo, MAX_DMABUF_BUFFERS, Matrix, Nv12Layout, Output,
-    StreamInfo, choose_output, scale_target,
+    DmabufDesc, FrameBuf, HwDec, HwInfo, MAX_DMABUF_BUFFERS, Matrix, Nv12Layout, Output,
+    StreamInfo, VideoSource, choose_output, scale_target,
 };
 use crate::pacing::{self, Clock};
 
@@ -88,7 +88,7 @@ mod keys {
 
 /// Opens the software decoder a VA-API one is swapped for; see
 /// [`Player::set_software`].
-pub type SoftwareFactory = Box<dyn FnOnce() -> Result<Box<dyn Decoder>, String> + Send>;
+pub type SoftwareFactory = Box<dyn FnOnce() -> Result<Box<dyn VideoSource>, String> + Send>;
 
 /// Commands to the decode thread.
 enum Cmd {
@@ -281,7 +281,7 @@ fn wire_matrix(m: Matrix) -> ColorMatrix {
 #[allow(clippy::needless_pass_by_value)] // `dec` is the thread's to own and drop.
 #[allow(clippy::too_many_lines)] // One loop over one command channel; split, it would pass eight locals around.
 fn decode_loop(
-    mut dec: Box<dyn Decoder>,
+    mut dec: Box<dyn VideoSource>,
     layout: Nv12Layout,
     rx: &Receiver<Cmd>,
     tx: &Sender<Msg>,
@@ -294,7 +294,7 @@ fn decode_loop(
     };
     let mut generation = 0;
     let mut skip_before: Option<i64> = None;
-    let seek = |dec: &mut Box<dyn Decoder>,
+    let seek = |dec: &mut Box<dyn VideoSource>,
                 g: u32,
                 secs: f64,
                 generation: &mut u32,
@@ -451,7 +451,7 @@ impl Player {
     ///
     /// # Errors
     /// A pipe or thread failure.
-    pub fn new(dec: Box<dyn Decoder>, opts: Opts) -> Result<Self, String> {
+    pub fn new(dec: Box<dyn VideoSource>, opts: Opts) -> Result<Self, String> {
         let info = dec.info().clone();
         let hw = dec.hw();
         let layout = Nv12Layout::for_video(info.width, info.height);

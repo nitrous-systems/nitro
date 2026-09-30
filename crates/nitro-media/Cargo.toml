@@ -1,0 +1,21 @@
+[package]
+name = "nitro-media"
+description = "Media vocabulary (nodes, ports, formats, buffers, clock), the video source trait and frame types, the decode-helper protocol + reply validation, and a synthetic source"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The helper protocol's framing (`Reader`/`Writer`/`Frame`), and DRM
+# modifier constants in docs and tests.
+nitro-wire = { workspace = true }
+# Sealed memfds for the synthetic source's emulated VA surfaces.
+nitro-shm = { workspace = true }
+# `fs` for `lseek` (sizing dma-bufs and memfds in validation); `io::dup`
+# for the synthetic source's plane fds. Both already enabled elsewhere in
+# the workspace, so no feature unification changes a binary.
+rustix = { workspace = true, features = ["fs"] }

@@ -21,7 +21,8 @@ without pointer motion while playing.
 |---|---|
 | `src/shim.c` | the only code that sees FFmpeg: `nv_open/info/hw_info/seek/next/next_hw/release/close` over libavformat + libavcodec + libavutil's hwcontext, 4:2:0 → NV12 without swscale |
 | `src/ffmpeg.rs` | `LibavDecoder` and `open` (VA-API first, software fallback), the eight `extern "C"` calls (the crate's `unsafe` exception, see `DEPENDENCIES.md`) |
-| `src/decode.rs` | the `Decoder` trait, `StreamInfo`, `FrameBuf::{Shm, DmaBuf}`, the output policy `choose_output`, `SyntheticDecoder` (with an emulated VA pool for tests) |
+| `src/decode.rs` | the output policy `choose_output`, `scale_target`, `SCALE_POOL`; re-exports the seam from `nitro-media` |
+| `nitro-media` (crate) | the `VideoSource` trait, `StreamInfo`, `FrameBuf::{Shm, DmaBuf}`, `SyntheticDecoder` (with an emulated VA pool for tests), plus the helper protocol for phase 2 (#3988, `docs/media.md`) |
 | `src/player.rs` | decode thread, NV12 shm ring or registered dma-bufs, pacing against frame callbacks, `PresentSurface`, stats |
 | `src/pacing.rs` | pure clock + frame picking |
 | `src/controls.rs` | the nitro-ui overlay (`SurfaceView` + play, seek slider, time, repeat, fullscreen) |

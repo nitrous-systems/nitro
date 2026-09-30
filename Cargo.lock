@@ -385,6 +385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-media"
+version = "0.0.1"
+dependencies = [
+ "nitro-shm",
+ "nitro-wire",
+ "rustix",
+]
+
+[[package]]
 name = "nitro-png"
 version = "0.0.1"
 
@@ -500,6 +509,7 @@ name = "nitro-video"
 version = "0.0.1"
 dependencies = [
  "nitro-core",
+ "nitro-media",
  "nitro-shm",
  "nitro-ui",
  "nitro-wire",

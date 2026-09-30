@@ -14,6 +14,9 @@ workspace = true
 nitro-ui = { workspace = true }
 # Geometry types (`IRect`) shared with the wire.
 nitro-core = { workspace = true }
+# The decoder seam: `VideoSource`, the frame types, `SyntheticDecoder`
+# (#3988; FFmpeg itself stays here until the helper, phase 2).
+nitro-media = { workspace = true }
 # Sealed memfds for the NV12 ring the server maps.
 nitro-shm = { workspace = true }
 # The Surface message types (`CreateSurfaceBuffer`, `PresentSurface`).
