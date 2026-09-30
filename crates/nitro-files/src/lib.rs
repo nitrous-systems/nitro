@@ -88,7 +88,7 @@ use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::clipboard::{PLAIN_MIME, TEXT_MIME, URI_LIST_MIME};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
 use nitro_ui::split::{SidebarRow, sidebar_row, sidebar_section, sidebar_separator, split_view};
-use nitro_ui::widgets::{Button, Label, TextField, button, column, label, text_field};
+use nitro_ui::widgets::{Button, Label, TextField, button, column, label, row, spacer, text_field};
 use nitro_ui::{App, Error, List, Row, Ui, WidgetId};
 
 use dir::{Entry, Kind, Sort};
@@ -148,34 +148,60 @@ pub mod names {
     pub const STATUS: &str = "status";
     /// The rename / new-folder field.
     pub const EDIT: &str = "edit";
+    /// The confirm panel above the status line, collapsed unless a
+    /// question is pending.
+    pub const CONFIRM: &str = "confirm";
+    /// The confirm panel's question.
+    pub const CONFIRM_TEXT: &str = "confirm_text";
+    /// The confirm panel's "do it" button.
+    pub const CONFIRM_OK: &str = "confirm_ok";
+    /// The confirm panel's Cancel button.
+    pub const CONFIRM_CANCEL: &str = "confirm_cancel";
 }
 
-/// A pending question the status line is asking, waiting for `y`/`n`.
+/// A pending question, shown in the confirm panel above the status line.
 ///
-/// A one-line confirm rather than a modal dialog, and that is a design
-/// decision rather than a shortcut: the toolkit has no modal windows, a
-/// dialog would need one, and a file manager whose delete key can be
-/// answered without leaving the keyboard is the better interaction
-/// anyway. The status line says what will happen and the next key
-/// decides.
+/// An inline panel rather than a separate window: the toolkit has no
+/// modal windows, and the panel gets the behaviour that matters from one
+/// by taking the keyboard while it is up (see [`app_key`]). It has
+/// Confirm/Cancel buttons for the mouse; Enter (or `y`) confirms and
+/// Escape (or `n`) cancels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
-    /// Move these paths to the trash.
+    /// Move these paths to the trash (`Delete`).
     Trash(Vec<PathBuf>),
+    /// Delete these paths permanently, skipping the trash
+    /// (`Shift+Delete`).
+    Delete(Vec<PathBuf>),
 }
 
 impl Confirm {
-    /// The question, as the status line asks it.
+    /// The question: the file's name when there is one, the count when
+    /// there are several.
     #[must_use]
     pub fn prompt(&self) -> String {
+        let what = |paths: &[PathBuf]| match paths {
+            [one] => one
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            many => format!("{} items", many.len()),
+        };
         match self {
-            Confirm::Trash(paths) => match paths.as_slice() {
-                [one] => format!(
-                    "Move {} to the trash? [y/n]",
-                    one.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                many => format!("Move {} items to the trash? [y/n]", many.len()),
-            },
+            Confirm::Trash(paths) => format!("Move {} to the trash?", what(paths)),
+            Confirm::Delete(paths) => {
+                format!("Permanently delete {}? This cannot be undone.", what(paths))
+            }
+        }
+    }
+
+    /// The confirm button's label.
+    #[must_use]
+    pub fn action_label(&self) -> &'static str {
+        match self {
+            Confirm::Trash(_) => "Move to Trash",
+            Confirm::Delete(_) => "Delete Permanently",
         }
     }
 }
@@ -583,10 +609,16 @@ pub struct Ids {
     pub edit: WidgetId,
     /// The back button.
     pub back: WidgetId,
+    /// The confirm panel, collapsed unless a question is pending.
+    pub confirm: WidgetId,
+    /// The confirm panel's question.
+    pub confirm_text: WidgetId,
+    /// The confirm panel's "do it" button.
+    pub confirm_ok: WidgetId,
 }
 
 impl Ids {
-    /// Locate the four widgets in a tree [`build`] made.
+    /// Locate the widgets in a tree [`build`] made.
     ///
     /// `None` if any of them is missing, which in practice means the
     /// tree was not built by [`build`].
@@ -599,6 +631,9 @@ impl Ids {
             status: find(names::STATUS)?,
             edit: find(names::EDIT)?,
             back: find(names::BACK)?,
+            confirm: find(names::CONFIRM)?,
+            confirm_text: find(names::CONFIRM_TEXT)?,
+            confirm_ok: find(names::CONFIRM_OK)?,
         })
     }
 }
@@ -762,8 +797,44 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
     );
     ui.attach(footer_pad, status)
         .expect("attach the status line");
+
+    // The confirm panel, built once and collapsed when idle, like the
+    // edit field. The buttons defer: answering collapses the panel the
+    // button sits in.
+    // The question sits on its own line and the buttons under it, right
+    // aligned: a long question beside the buttons would push them out of
+    // a narrow window.
+    let confirm_text = ui.build(label("").name(names::CONFIRM_TEXT).width_percent(1.0));
+    let confirm_cancel = ui.build(button("Cancel").name(names::CONFIRM_CANCEL).on_click(
+        |_s: &mut Files, ui: &mut Ui<Files>| {
+            ui.defer(|s: &mut Files, ui: &mut Ui<Files>| answer(s, ui, false));
+        },
+    ));
+    let confirm_ok = ui.build(button("OK").name(names::CONFIRM_OK).on_click(
+        |_s: &mut Files, ui: &mut Ui<Files>| {
+            ui.defer(|s: &mut Files, ui: &mut Ui<Files>| answer(s, ui, true));
+        },
+    ));
+    let confirm_buttons = ui.build(row().gap(8.0).width_percent(1.0));
+    let confirm_push = ui.build(spacer());
+    for child in [confirm_push, confirm_cancel, confirm_ok] {
+        ui.attach(confirm_buttons, child)
+            .expect("attach a confirm button");
+    }
+    let confirm = ui.build(
+        column()
+            .name(names::CONFIRM)
+            .gap(6.0)
+            .width_percent(1.0)
+            .padding_xy(nitro_ui::split::CONTENT_GUTTER, 6.0)
+            .collapsed(true),
+    );
+    for child in [confirm_text, confirm_buttons] {
+        ui.attach(confirm, child).expect("attach the confirm panel");
+    }
+
     let footer = ui.build(column().width_percent(1.0));
-    for child in [footer_line, footer_pad] {
+    for child in [footer_line, confirm, footer_pad] {
         ui.attach(footer, child).expect("attach the footer");
     }
 
@@ -973,24 +1044,18 @@ fn sort_name(sort: Sort) -> &'static str {
 /// So a pending confirm **takes the keyboard**, by dropping the focus
 /// when the question is asked ([`ask`]) and giving it back when it is
 /// answered. With nothing focused, keys bubble from the root and reach
-/// this handler first, which is what makes a one-line prompt behave
-/// like a dialog without being one.
+/// this handler first, which is what makes the inline confirm panel
+/// behave like a modal dialog without being one: Enter or `y` confirms,
+/// Escape or `n` cancels, and nothing else gets through.
 fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
     if s.confirm.is_some() {
         return match k.keycode {
-            key::Y => {
-                let c = s.confirm.take();
-                if let Some(c) = c {
-                    run_confirm(s, ui, &c);
-                }
-                restore_focus(s, ui);
+            key::ENTER | key::Y => {
+                answer(s, ui, true);
                 Handled::Yes
             }
             key::N | key::ESC => {
-                s.confirm = None;
-                s.message = Some("cancelled".to_owned());
-                restore_focus(s, ui);
-                show_status(s, ui);
+                answer(s, ui, false);
                 Handled::Yes
             }
             // A key that is neither is ignored rather than passed on: a
@@ -1019,7 +1084,15 @@ fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
             start_edit(s, ui, Editing::Rename(path), &name);
             Handled::Yes
         }
-        key::DELETE => {
+        key::DELETE if k.mods & mods::MASK == mods::SHIFT => {
+            let paths = selected_paths(s, ui);
+            if paths.is_empty() {
+                return Handled::No;
+            }
+            ask(s, ui, Confirm::Delete(paths));
+            Handled::Yes
+        }
+        key::DELETE if k.mods & mods::MASK == mods::NONE => {
             let paths = selected_paths(s, ui);
             if paths.is_empty() {
                 return Handled::No;
@@ -1035,14 +1108,43 @@ fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
     }
 }
 
-/// Ask a question in the status line, and take the keyboard while it is
-/// unanswered.
+/// Ask a question in the confirm panel, and take the keyboard while it
+/// is unanswered.
 ///
 /// Dropping the focus is the whole mechanism: see [`app_key`] for the
 /// box run that found out what happens without it.
 pub fn ask(s: &mut Files, ui: &mut Ui<Files>, what: Confirm) {
+    if let Some(ids) = s.ids {
+        match ui.widget_mut::<Label>(ids.confirm_text) {
+            Ok(mut l) => l.set_text(what.prompt()),
+            Err(e) => complain("the confirm question", &e),
+        }
+        match ui.widget_mut::<Button<Files>>(ids.confirm_ok) {
+            Ok(mut b) => b.set_text(what.action_label()),
+            Err(e) => complain("the confirm button", &e),
+        }
+        ui.set_collapsed(ids.confirm, false);
+    }
     s.confirm = Some(what);
     ui.blur(s);
+    show_status(s, ui);
+}
+
+/// Answer the pending question: run it (`yes`) or cancel it, close the
+/// panel and give the keyboard back to the list.
+pub fn answer(s: &mut Files, ui: &mut Ui<Files>, yes: bool) {
+    let Some(what) = s.confirm.take() else {
+        return;
+    };
+    if let Some(ids) = s.ids {
+        ui.set_collapsed(ids.confirm, true);
+    }
+    if yes {
+        run_confirm(s, ui, &what);
+    } else {
+        s.message = Some("cancelled".to_owned());
+    }
+    restore_focus(s, ui);
     show_status(s, ui);
 }
 
@@ -1085,6 +1187,22 @@ fn run_confirm(s: &mut Files, ui: &mut Ui<Files>, what: &Confirm) {
                 Some(e) => e,
                 None if done == 1 => "moved 1 item to the trash".to_owned(),
                 None => format!("moved {done} items to the trash"),
+            });
+            relist(s, ui);
+        }
+        Confirm::Delete(paths) => {
+            let mut done = 0usize;
+            let mut failure = None;
+            for p in paths {
+                match ops::remove(p) {
+                    Ok(()) => done += 1,
+                    Err(e) => failure = Some(format!("{}: {e}", short(p))),
+                }
+            }
+            s.message = Some(match failure {
+                Some(e) => e,
+                None if done == 1 => "deleted 1 item".to_owned(),
+                None => format!("deleted {done} items"),
             });
             relist(s, ui);
         }

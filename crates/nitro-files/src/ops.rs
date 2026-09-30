@@ -269,11 +269,23 @@ fn move_by_copy(src: &Path, target: &Path) -> Result<(), Error> {
         };
         return Err(e);
     }
-    let md = std::fs::symlink_metadata(src)?;
-    if md.is_dir() {
-        std::fs::remove_dir_all(src)?;
+    remove(src)
+}
+
+/// Delete `path` permanently — no trash: a file or symlink is unlinked,
+/// a directory is removed with everything under it.
+///
+/// The check looks at the link itself (`symlink_metadata`), so a symlink
+/// to a directory is unlinked and its target is never touched: a
+/// permanent delete of a link must not reach through it.
+///
+/// # Errors
+/// [`Error::Io`] when the path cannot be read or removed.
+pub fn remove(path: &Path) -> Result<(), Error> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir_all(path)?;
     } else {
-        std::fs::remove_file(src)?;
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -659,6 +671,35 @@ mod tests {
         move_by_copy(&link, &dir.join("link-copy")).expect("move");
         assert!(!link.exists());
         assert_eq!(read(&target.join("deep/x")), "deep", "the target survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_deletes_files_and_trees_and_only_unlinks_symlinks() {
+        let dir = scratch("remove");
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").expect("write");
+        remove(&file).expect("remove a file");
+        assert!(!file.exists());
+
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("deep/er")).expect("mkdir");
+        std::fs::write(tree.join("deep/er/x"), b"deep").expect("write");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&tree, &link).expect("symlink");
+        remove(&link).expect("remove a link");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link is gone"
+        );
+        assert_eq!(read(&tree.join("deep/er/x")), "deep", "its target survived");
+
+        remove(&tree).expect("remove a tree");
+        assert!(!tree.exists());
+        assert!(
+            matches!(remove(&tree), Err(Error::Io(_))),
+            "a missing path is an error"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

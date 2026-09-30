@@ -816,7 +816,7 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
         "Delete asks about the row under the cursor"
     );
     assert!(
-        status(&h, ids).contains(&format!("Move {VICTIM} to the trash? [y/n]")),
+        status(&h, ids).contains(&format!("Move {VICTIM} to the trash?")),
         "and asks it in the status line: {:?}",
         status(&h, ids)
     );
@@ -1011,6 +1011,174 @@ fn answering_y_moves_the_file_into_the_trash_with_its_info_file() {
         "the listing refreshed itself after the move"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+/// The confirm panel's question, or `None` while it is collapsed.
+fn confirm_question(h: &mut Harness<Files>, ids: Ids) -> Option<String> {
+    if h.ui().is_collapsed(ids.confirm) || !h.ui().is_visible(ids.confirm) {
+        return None;
+    }
+    Some(h.widget::<Label>(ids.confirm_text).text().to_owned())
+}
+
+#[test]
+fn shift_delete_asks_and_enter_deletes_permanently() {
+    let (root, dir) = fixture("delete-enter");
+    let xdg = root.join("xdg");
+    write(&dir.join("notes.txt"), "gone for good");
+    write(&dir.join("keep.txt"), "untouched");
+    let (mut h, ids) = app(&dir, &xdg);
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(
+        confirm_question(&mut h, ids),
+        None,
+        "no panel while nothing is asked"
+    );
+
+    h.key_with(key::LEFT_SHIFT, key::DELETE);
+    h.settle();
+    assert_eq!(
+        h.state().pending_confirm(),
+        Some(&Confirm::Delete(vec![dir.join("notes.txt")]))
+    );
+    let prompt = "Permanently delete notes.txt? This cannot be undone.";
+    assert_eq!(confirm_question(&mut h, ids).as_deref(), Some(prompt));
+    assert!(status(&h, ids).contains(prompt), "{:?}", status(&h, ids));
+    assert_eq!(
+        h.widget::<Button<Files>>(ids.confirm_ok).text(),
+        "Delete Permanently"
+    );
+    assert_eq!(h.ui().focused(), None, "the question takes the keyboard");
+
+    h.key(key::ENTER);
+    h.settle();
+    assert!(h.state().pending_confirm().is_none());
+    assert!(!dir.join("notes.txt").exists(), "the file is gone");
+    assert!(
+        !xdg.join("Trash/files/notes.txt").exists(),
+        "and not into the trash"
+    );
+    assert_eq!(h.state().message(), Some("deleted 1 item"));
+    assert_eq!(confirm_question(&mut h, ids), None, "the panel closed");
+    assert_eq!(h.ui().focused(), Some(ids.list));
+    assert_eq!(names_of(&h, ids), ["keep.txt"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn escape_cancels_a_permanent_delete() {
+    let (root, dir) = fixture("delete-esc");
+    write(&dir.join("notes.txt"), "still here");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    h.key_with(key::LEFT_SHIFT, key::DELETE);
+    h.settle();
+    assert!(confirm_question(&mut h, ids).is_some());
+    h.key(key::ESC);
+    h.settle();
+    assert!(h.state().pending_confirm().is_none());
+    assert!(dir.join("notes.txt").exists(), "the file stays");
+    assert_eq!(h.state().message(), Some("cancelled"));
+    assert_eq!(confirm_question(&mut h, ids), None);
+    assert_eq!(h.ui().focused(), Some(ids.list));
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn delete_then_enter_moves_to_the_trash() {
+    let (root, dir) = fixture("trash-enter");
+    let xdg = root.join("xdg");
+    write(&dir.join("doomed.txt"), "goodbye");
+    let (mut h, ids) = app(&dir, &xdg);
+    h.key(key::DELETE);
+    h.settle();
+    assert_eq!(
+        confirm_question(&mut h, ids).as_deref(),
+        Some("Move doomed.txt to the trash?")
+    );
+    assert_eq!(
+        h.widget::<Button<Files>>(ids.confirm_ok).text(),
+        "Move to Trash"
+    );
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().message(), Some("moved 1 item to the trash"));
+    assert!(!dir.join("doomed.txt").exists());
+    assert!(xdg.join("Trash/files/doomed.txt").exists());
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn shift_delete_of_several_names_the_count_and_removes_directories() {
+    let (root, dir) = fixture("delete-many");
+    let xdg = root.join("xdg");
+    std::fs::create_dir_all(dir.join("folder/deep")).expect("mkdir");
+    write(&dir.join("folder/deep/x"), "deep");
+    write(&dir.join("a.txt"), "a");
+    write(&dir.join("keep.txt"), "keep");
+    let (mut h, ids) = app(&dir, &xdg);
+    assert_eq!(names_of(&h, ids), ["folder", "a.txt", "keep.txt"]);
+    h.key_with(key::LEFT_SHIFT, key::DOWN);
+    h.settle();
+
+    h.key_with(key::LEFT_SHIFT, key::DELETE);
+    h.settle();
+    assert_eq!(
+        confirm_question(&mut h, ids).as_deref(),
+        Some("Permanently delete 2 items? This cannot be undone.")
+    );
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().message(), Some("deleted 2 items"));
+    assert!(
+        !dir.join("folder").exists(),
+        "the directory went recursively"
+    );
+    assert!(!dir.join("a.txt").exists());
+    assert!(!xdg.join("Trash/files/folder").exists());
+    assert_eq!(names_of(&h, ids), ["keep.txt"]);
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+/// Click a button through its `click` action — the path `hey` takes.
+/// The fake output is narrower than the test window, so the footer's
+/// right-hand buttons are off-screen to a real pointer.
+fn click_action(h: &mut Harness<Files>, id: nitro_ui::WidgetId) {
+    let (ui, state) = h.parts();
+    ui.action(state, id, "click", None).expect("click");
+    h.settle();
+}
+
+#[test]
+fn the_confirm_panel_buttons_cancel_and_confirm() {
+    let (root, dir) = fixture("confirm-buttons");
+    write(&dir.join("notes.txt"), "x");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let cancel = nitro_ui::introspect::resolve(h.ui(), names::CONFIRM_CANCEL).expect("cancel");
+
+    h.key_with(key::LEFT_SHIFT, key::DELETE);
+    h.settle();
+    click_action(&mut h, cancel);
+    h.settle();
+    assert!(h.state().pending_confirm().is_none());
+    assert_eq!(h.state().message(), Some("cancelled"));
+    assert!(dir.join("notes.txt").exists());
+    assert_eq!(confirm_question(&mut h, ids), None);
+
+    h.key_with(key::LEFT_SHIFT, key::DELETE);
+    h.settle();
+    click_action(&mut h, ids.confirm_ok);
+    h.settle();
+    assert_eq!(h.state().message(), Some("deleted 1 item"));
+    assert!(!dir.join("notes.txt").exists());
+    assert_eq!(confirm_question(&mut h, ids), None);
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }

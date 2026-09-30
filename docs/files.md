@@ -801,13 +801,17 @@ anything is written, by lexical path prefix; the depth is bounded at 100
 anyway, so the worst a devious symlink back into the source can do is
 fill a disk with a bounded amount of data rather than loop forever.
 
-Move and delete are deliberately *not* here. Deleting is the trash,
-because a file manager one mis-keypress from an unrecoverable delete is a
-bad afternoon waiting to happen; moving is a `rename` the app can do
+Move is deliberately *not* here: moving is a `rename` the app can do
 directly, and a cross-filesystem move has the copy-then-delete problem
-the trash module argues about above.
+the trash module argues about above. Delete is here as `ops::remove`, and
+it is reached only through `Shift+Delete`: plain `Delete` is the trash,
+because a file manager one mis-keypress from an unrecoverable delete is a
+bad afternoon waiting to happen, and the permanent delete is guarded by a
+confirm that says so ("… This cannot be undone."). It looks at the link
+itself, so a symlink to a directory is unlinked and its target untouched.
 
-### The keys, and why a confirm is a status line
+
+### The keys, and the inline confirm panel
 
 | key | what |
 |---|---|
@@ -818,23 +822,24 @@ the trash module argues about above.
 | Shift+↑↓, Shift-click | extend the selection from the anchor |
 | Ctrl-click / Ctrl+Shift-click | toggle a row / add a range to the selection |
 | `F2` | rename the cursor's row |
-| `Delete` | move the selection to the trash, after a `y`/`n` |
+| `Delete` | move the selection to the trash, after a confirm |
+| `Shift+Delete` | delete the selection permanently, after a confirm |
 | `Ctrl+N` | new folder |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut paths to the system clipboard / paste files from it here (a cut paste moves) |
 | `Ctrl+H` | show hidden files |
 | `Ctrl+S` | cycle the sort: name → size → date |
-| `Escape` | cancel an edit, or answer a confirm with "no" |
+| `Enter` / `y` | answer a pending confirm with "yes" |
+| `Escape` / `n` | cancel an edit, or answer a confirm with "no" |
 
-The delete confirmation is **one line in the status bar**, not a dialog,
-and that is a decision rather than a shortcut. The toolkit has no modal
-windows; a dialog would need one. A file manager whose delete key can be
-answered without leaving the keyboard is the better interaction anyway:
-the status line says what will happen and the next key decides. While a
-question is pending it swallows every key, which is what makes a one-line
-prompt behave like a dialog without being one — a key that is neither `y`
-nor `n` is *ignored* rather than passed on, because a question on screen
-that the next keystroke silently dismissed would be worse than one that
-waits.
+A delete confirmation is an **inline panel** above the status line, not
+a separate window: the toolkit has no modal windows. The panel is built
+once and collapsed when idle, like the edit field. It names the file (or
+counts several) and has Cancel and "Move to Trash" / "Delete
+Permanently" buttons. While a question is pending it swallows every key,
+which is what makes the panel behave like a modal dialog without being
+one. Enter or `y` confirms, Escape or `n` cancels, and any other key is
+*ignored* rather than passed on, because a question on screen that the
+next keystroke silently dismissed would be worse than one that waits.
 
 The plain keys (`y`, `n`, `F2`, `Delete`, `Escape`) are `on_key`
 handlers rather than shortcuts, which means the focused widget sees them
@@ -850,8 +855,8 @@ row beginning with `n`", and the file being deleted was called
 a confirmation whose meaning depended on the file names in the
 directory. A pending question therefore **takes the keyboard** — `ask`
 drops the focus, answering gives it back — so the keys bubble from the
-root and reach the app handler first. That is the whole of what makes a
-one-line prompt behave like a dialog without being one, and
+root and reach the app handler first. That is the whole of what makes the
+inline panel behave like a dialog without being one, and
 `delete_asks_first_and_n_leaves_the_file_where_it_is` pins it, including
 that the focus is *borrowed* rather than kept.
 
