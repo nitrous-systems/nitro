@@ -27,7 +27,10 @@ fn now_ns() -> u64 {
 
 /// Wait until `fd` is readable (a `sync_file` signalled), at most 1 s.
 fn wait_fence(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+    let mut fds = [rustix::event::PollFd::new(
+        &fd,
+        rustix::event::PollFlags::IN,
+    )];
     let t = rustix::event::Timespec {
         tv_sec: 1,
         tv_nsec: 0,
@@ -47,7 +50,10 @@ fn next(conn: &mut Connection, seen: &mut Vec<ServerMsg>) -> io::Result<()> {
             return Err(err("no message from the server in 10 s"));
         }
         let fd = conn.as_fd();
-        let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
         let t = rustix::event::Timespec {
             tv_sec: 0,
             tv_nsec: 100_000_000,
@@ -66,7 +72,8 @@ pub fn run(frames: u32, output: Option<&str>, fps: u32, file: Option<&Path>) -> 
     if !conn.has_caps(caps::CAPTURE) {
         return Err(err("the server does not offer caps::CAPTURE"));
     }
-    conn.client_caps(caps::CAPTURE | caps::OUTPUTS).map_err(err)?;
+    conn.client_caps(caps::CAPTURE | caps::OUTPUTS)
+        .map_err(err)?;
     conn.list_outputs().map_err(err)?;
     let mut seen = Vec::new();
     let mut outputs = Vec::new();
@@ -163,7 +170,11 @@ pub fn run(frames: u32, output: Option<&str>, fps: u32, file: Option<&Path>) -> 
     conn.capture_stop(ID).map_err(err)?;
     conn.flush().map_err(err)?;
     lat_us.sort_unstable();
-    let pct = |p: usize| lat_us.get((lat_us.len() * p / 100).min(lat_us.len() - 1)).copied();
+    let pct = |p: usize| {
+        lat_us
+            .get((lat_us.len() * p / 100).min(lat_us.len() - 1))
+            .copied()
+    };
     let fps_got = if secs > 0.0 && got > 1 {
         f64::from(got - 1) / secs
     } else {
@@ -180,7 +191,10 @@ pub fn run(frames: u32, output: Option<&str>, fps: u32, file: Option<&Path>) -> 
         match last {
             Some(px) => {
                 let stride = b.slots[0].pitch;
-                std::fs::write(path, crate::png::encode_xrgb(b.width, b.height, stride, &px))?;
+                std::fs::write(
+                    path,
+                    crate::png::encode_xrgb(b.width, b.height, stride, &px),
+                )?;
             }
             None => eprintln!("no LINEAR frame to write"),
         }

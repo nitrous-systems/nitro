@@ -835,8 +835,12 @@ impl Server {
             let fd = snap.fd.try_clone().ok()?;
             let poll = EpollPoll(&self.epoll);
             if let Some((_, old)) = self.captures.list[i].snap.take() {
-                self.gpu
-                    .send(&poll, TOK_GPU, &nitro_gpu::ToHelper::Release { id: old }, Vec::new());
+                self.gpu.send(
+                    &poll,
+                    TOK_GPU,
+                    &nitro_gpu::ToHelper::Release { id: old },
+                    Vec::new(),
+                );
             }
             let sid = self.gpu.tex_id();
             let desc = proto::ShadowDesc {
@@ -914,8 +918,8 @@ impl Snapshot {
         const PAGE: usize = 4096;
         let len = geom.2 as usize * geom.1 as usize;
         let padded = len.max(1).div_ceil(PAGE) * PAGE;
-        let fd = nitro_shm::create_sealed("nitro-capture", padded as u64)
-            .map_err(|e| e.to_string())?;
+        let fd =
+            nitro_shm::create_sealed("nitro-capture", padded as u64).map_err(|e| e.to_string())?;
         let map = nitro_shm::MappingMut::map_mut(std::os::fd::AsFd::as_fd(&fd), padded)
             .map_err(|e| e.to_string())?;
         Ok(Self {
