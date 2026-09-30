@@ -2583,6 +2583,7 @@ impl Server {
         }
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
+        let origin = self.output_origin(scene_id);
         // Spent whatever this paint does: see `OutputState::take_scroll`.
         let scroll = self.outputs[index].take_scroll();
         // A snap overview's scaled items are all thumbnails: they take the
@@ -2630,6 +2631,7 @@ impl Server {
                         items: &mut self.paint_items,
                         palette: &self.palette,
                         output: scene_id,
+                        origin,
                         bounds,
                         cursor: (&self.cursor, cursor_state),
                         fast_scaled,
@@ -2651,6 +2653,7 @@ impl Server {
                     &mut self.text,
                     &mut self.icons,
                     scene_id,
+                    origin,
                     &region,
                     (&self.cursor, cursor_state),
                     &mut self.paint_items,
@@ -2724,6 +2727,14 @@ impl Server {
         // above covers its hole whatever its alpha (#3899).
         let holes = output.decision.need_alpha() && self.scene.has_holes(output.scene_id);
         frame::select_scanout_alpha(self.backend.as_mut(), output, holes);
+    }
+
+    /// An output's origin in global device pixels, `(0, 0)` for one at
+    /// the origin (or one the scene no longer knows).
+    fn output_origin(&self, output: SceneOutputId) -> (i32, i32) {
+        self.scene
+            .output_info(output)
+            .map_or((0, 0), |(rect, _)| (rect.x, rect.y))
     }
 
     /// Where the cursor is on `output`, in that output's buffer space,
@@ -12339,6 +12350,9 @@ struct ShadowPaint<'a> {
     items: &'a mut Vec<nitro_scene::PaintItem>,
     palette: &'a nitro_core::Palette,
     output: SceneOutputId,
+    /// The output's origin in global device pixels: `bounds` and the
+    /// rasterized region are output-local.
+    origin: (i32, i32),
     bounds: nitro_core::IRect,
     cursor: (&'a Cursor, CursorState),
     /// [`frame::paint_region`]'s `fast_scaled`: this output shows a snap
@@ -12388,6 +12402,7 @@ fn paint_shadow(
             &mut *p.text,
             &mut *p.icons,
             p.output,
+            p.origin,
             &leftover,
             p.cursor,
             &mut *p.items,
@@ -12401,6 +12416,7 @@ fn paint_shadow(
             &mut *p.text,
             &mut *p.icons,
             p.output,
+            p.origin,
             rasterize,
             p.cursor,
             &mut *p.items,
@@ -12419,7 +12435,8 @@ fn paint_shadow(
 /// The pixels this paint may move rather than rasterize, when every
 /// precondition of the scroll blit holds: the hint is not blocked, the
 /// output starts at the device origin (so its local pixels are the global
-/// ones `paint_list` works in, exactly as `frame::paint_region` uses it),
+/// ones `paint_list` and the scene's cover work in: unlike
+/// `frame::paint_region`, the blit arithmetic does not shift by an origin),
 /// the scene can describe the moved subtree's cover, and the resulting
 /// region is non-empty. See [`frame::blit_region`] for the rule.
 fn scroll_blit_region(
@@ -13104,6 +13121,7 @@ impl Server {
         };
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
+        let origin = self.output_origin(scene_id);
         let scroll = self.outputs[index].take_scroll();
         let fast_scaled = self
             .wm
@@ -13132,6 +13150,7 @@ impl Server {
                     items: &mut self.paint_items,
                     palette: &self.palette,
                     output: scene_id,
+                    origin,
                     bounds,
                     cursor: (&self.cursor, cursor_state),
                     fast_scaled,

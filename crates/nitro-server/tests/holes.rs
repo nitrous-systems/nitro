@@ -90,6 +90,7 @@ impl World {
             &mut TextEngine::new(),
             &mut IconEngine::new(),
             OUT,
+            (0, 0),
             &[IRect::new(0, 0, W.cast_signed(), H.cast_signed())],
             (&Cursor::new(), state),
             &mut items,

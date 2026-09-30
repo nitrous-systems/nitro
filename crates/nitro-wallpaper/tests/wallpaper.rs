@@ -379,7 +379,7 @@ fn a_second_output_gets_its_own_wallpaper_and_loses_it_on_unplug() {
     assert_eq!(h.ui().window_size_of(second), Size::new(400.0, 300.0));
 
     // The first output is still covered. The second's *pixels* are
-    // asserted in `a_second_output_is_painted`, ignored until #3936.
+    // asserted in `a_second_output_is_painted`.
     let (sw, sh, px) = shot_of(&h, &output_names(&h)[0].0);
     for (x, y) in [(0, 0), (sw - 1, 0), (0, sh - 1), (sw / 2, sh / 2)] {
         assert_eq!(px[(y * sw + x) as usize], 0x0020_2430, "({x}, {y})");
@@ -437,7 +437,7 @@ fn an_image_is_decoded_once_and_scaled_per_output() {
     );
 
     // The quadrants land in the right place on the first output; the
-    // second's pixels wait on #3936 (see `a_second_output_is_painted`).
+    // second's are asserted in `a_second_output_is_painted`.
     let (name, _, _) = output_names(&h)[0].clone();
     assert_quadrants(&h, &name);
 
@@ -476,12 +476,11 @@ fn assert_quadrants(h: &Harness<Wallpaper>, name: &str) {
 }
 
 #[test]
-#[ignore = "#3936: nitro-server paints an output not at (0, 0) offset by its origin"]
 fn a_second_output_is_painted() {
     // Pixels on the second output, each output's copy scaled to its own
-    // size. The wallpaper's side is right (the geometry and the scaled
-    // sizes are asserted above); the server draws output 2 shifted by
-    // its desktop origin, so its left 320 columns show the background.
+    // size — including the columns left of the first output's width,
+    // which the server once painted shifted by the output's origin
+    // (#3936).
     let mut h = wallpaper(&quadrants());
     h.settle();
     assert_eq!(h.server().request_line("plug 400x200\n"), "ok");

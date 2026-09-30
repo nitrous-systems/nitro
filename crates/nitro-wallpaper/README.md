@@ -120,10 +120,6 @@ every other nitro app has.
 
 ## Limitations
 
-* **Output 2's pixels are not asserted yet.** The server currently
-  paints an output that is not at the desktop origin shifted by that
-  origin (#3936), so `a_second_output_is_painted` is `#[ignore]`d until
-  that lands; the geometry, the counts and the scaled sizes are asserted.
 * **P6 PPM only**, argued above.
 * **The image is stretched**, not letterboxed or tiled. Aspect-ratio
   modes are a flag and a rectangle calculation, and nothing in M3 needs

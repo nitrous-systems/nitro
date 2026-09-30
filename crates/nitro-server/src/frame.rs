@@ -1012,6 +1012,11 @@ pub struct CursorState {
 /// Returns the microseconds spent, which is what the `paint_us` statistic
 /// records: it covers the rasterization only, not the copy or the commit.
 ///
+/// `region` is in canvas (output-local) pixels; `origin` is the output's
+/// origin in global device pixels, `(0, 0)` for an output at the origin.
+/// The paint list is asked for the region moved to global pixels and its
+/// items are moved back (as [`paint_items`] does) before they are drawn.
+///
 /// `fast_scaled` is [`paint_items`]' flag: scaled opaque XR24 images go
 /// through [`Canvas::blit_xrgb_scaled`]. The server sets it only on the
 /// output of a **snap** overview, where every scaled item is a thumbnail.
@@ -1022,6 +1027,7 @@ pub fn paint_region(
     text: &mut TextEngine,
     icons: &mut IconEngine,
     output: OutputId,
+    origin: (i32, i32),
     region: &[IRect],
     cursor: (&Cursor, CursorState),
     items: &mut Vec<PaintItem>,
@@ -1037,6 +1043,7 @@ pub fn paint_region(
             text,
             icons,
             output,
+            origin,
             region,
             cursor,
             items,
@@ -1051,7 +1058,8 @@ pub fn paint_region(
             continue;
         }
         items.clear();
-        scene.paint_list(output, &clip, items);
+        scene.paint_list(output, &clip.translate(origin.0, origin.1), items);
+        localize_items(items, origin);
         paint_clip(
             canvas,
             scene,
@@ -1078,6 +1086,8 @@ pub fn paint_region(
 /// against the larger box are narrowed to exactly what the per-rect list
 /// would have held. Occlusion (`opaque_cover` containing the rect) asks
 /// the same question of the same world bounds.
+///
+/// `region` and `origin` are as in [`paint_region`].
 #[allow(clippy::too_many_arguments)] // As `paint_region`.
 pub fn paint_region_shared(
     canvas: &mut Canvas<'_>,
@@ -1085,6 +1095,7 @@ pub fn paint_region_shared(
     text: &mut TextEngine,
     icons: &mut IconEngine,
     output: OutputId,
+    origin: (i32, i32),
     region: &[IRect],
     cursor: (&Cursor, CursorState),
     items: &mut Vec<PaintItem>,
@@ -1097,7 +1108,8 @@ pub fn paint_region_shared(
         .fold(IRect::EMPTY, |acc, r| acc.union(r))
         .intersect(&canvas.bounds());
     items.clear();
-    scene.paint_list(output, &area, items);
+    scene.paint_list(output, &area.translate(origin.0, origin.1), items);
+    localize_items(items, origin);
     let mut local: Vec<PaintItem> = Vec::with_capacity(items.len());
     // Declared opaque regions (#3877), in device px: splitting every damage
     // rect along them lets `paint_clip`'s occlusion test skip whatever lies
@@ -1358,6 +1370,33 @@ fn duration_us(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// `item` (global device pixels) moved into the pixels of a canvas whose
+/// origin is `offset` in global device pixels: its transform, clip and
+/// bounds all shift by `-offset`. A no-op for `(0, 0)`.
+fn localize(item: &PaintItem, offset: (i32, i32)) -> PaintItem {
+    if offset == (0, 0) {
+        return *item;
+    }
+    #[allow(clippy::cast_precision_loss)] // device coordinates, far below 2^24
+    let shift = nitro_core::Transform::translate(-offset.0 as f32, -offset.1 as f32);
+    PaintItem {
+        transform: shift.then(&item.transform),
+        clip: item.clip.translate(-offset.0, -offset.1),
+        bounds: item.bounds.translate(-offset.0, -offset.1),
+        ..*item
+    }
+}
+
+/// [`localize`] every item of a list in place.
+fn localize_items(items: &mut [PaintItem], offset: (i32, i32)) {
+    if offset == (0, 0) {
+        return;
+    }
+    for item in items {
+        *item = localize(item, offset);
+    }
+}
+
 /// Draw `items` (a [`Scene::paint_list`] or [`Scene::paint_window`]
 /// list, global device pixels) into `canvas`, clipped to `clip`
 /// (canvas pixels), each item moved by `offset` first — the canvas's
@@ -1370,7 +1409,7 @@ fn duration_us(d: Duration) -> u64 {
 /// onto its device rect rounded to whole pixels, rather than the general
 /// resampling blend (~12 ns/px) onto the exact one. They agree to ±1
 /// inside the rect; the rect's fractional edge pixels are the
-/// difference. The live output path sets it only on the output of a
+/// difference. The live output path ([`paint_region`]) sets it only on the output of a
 /// snap overview (whose scaled items are all thumbnails), so no live
 /// pixel outside one changes.
 #[allow(clippy::too_many_arguments)] // One paint call's inputs, as `paint_region`.
@@ -1389,19 +1428,8 @@ pub fn paint_items(
     if clip.is_empty() {
         return;
     }
-    #[allow(clippy::cast_precision_loss)] // device coordinates, far below 2^24
-    let shift = nitro_core::Transform::translate(-offset.0 as f32, -offset.1 as f32);
     for item in items {
-        let item = if offset == (0, 0) {
-            *item
-        } else {
-            PaintItem {
-                transform: shift.then(&item.transform),
-                clip: item.clip.translate(-offset.0, -offset.1),
-                bounds: item.bounds.translate(-offset.0, -offset.1),
-                ..*item
-            }
-        };
+        let item = localize(item, offset);
         if fast_scaled && paint_xrgb_scaled(canvas, &clip, &item, scene) {
             continue;
         }
@@ -2919,8 +2947,13 @@ mod overlay_tests {
     /// two scaled thumbnails — XR24, and AR24 with an opaque region (an
     /// alpha ring around an opaque interior).
     fn world(base: Base, scrim: f32) -> Scene {
+        world_at(base, scrim, (0, 0))
+    }
+
+    /// [`world`] on an output whose origin is `origin` (global device px).
+    fn world_at(base: Base, scrim: f32, origin: (i32, i32)) -> Scene {
         let mut s = Scene::new();
-        s.add_output(OUT, IRect::new(0, 0, W as i32, H as i32), 1.0);
+        s.add_output(OUT, IRect::new(origin.0, origin.1, W as i32, H as i32), 1.0);
         let size = Size::new(W as f32, H as f32);
         let wall = s.create_window(C, "wall", size, Layer::Background);
         s.place_window(wall, Some(OUT), Point::ZERO).unwrap();
@@ -3024,15 +3057,31 @@ mod overlay_tests {
     }
 
     fn painted(s: &Scene, region: &[IRect], fast: bool) -> Vec<u8> {
+        painted_at(s, (0, 0), region, fast, false)
+    }
+
+    fn painted_at(
+        s: &Scene,
+        origin: (i32, i32),
+        region: &[IRect],
+        fast: bool,
+        shared: bool,
+    ) -> Vec<u8> {
+        let paint = if shared {
+            paint_region_shared
+        } else {
+            paint_region
+        };
         let mut data = vec![0x5Au8; (W * H * 4) as usize];
         let mut canvas = Canvas::new(&mut data, W, H, W * 4);
         let (cur, state) = cursor();
-        paint_region(
+        paint(
             &mut canvas,
             s,
             &mut TextEngine::new(),
             &mut IconEngine::new(),
             OUT,
+            origin,
             region,
             (&cur, state),
             &mut Vec::new(),
@@ -3068,6 +3117,47 @@ mod overlay_tests {
             }
         }
         data
+    }
+
+    /// An output away from the origin (#3936): its region is output-local,
+    /// and it paints the pixels the same desktop does at (0, 0) — not the
+    /// desktop shifted by the output's origin. Up to ±1 per channel: a
+    /// thumbnail at a fractional position is shifted there and back in
+    /// `f32`, which may round its resampling differently. The per-rect and
+    /// the shared paint agree exactly.
+    #[test]
+    fn an_output_off_the_origin_paints_its_own_pixels() {
+        let regions: [&[IRect]; 2] = [
+            &[IRect::new(0, 0, 160, 100)],
+            &[IRect::new(3, 2, 50, 41), IRect::new(60, 30, 99, 70)],
+        ];
+        for base in [Base::Solid, Base::Gradient, Base::Image] {
+            let home = world(base, 0.5);
+            for origin in [(320, 0), (0, 200), (-40, 17)] {
+                let away = world_at(base, 0.5, origin);
+                for region in regions {
+                    for fast in [false, true] {
+                        let want = painted_at(&home, (0, 0), region, fast, false);
+                        let got = painted_at(&away, origin, region, fast, false);
+                        let worst = got
+                            .iter()
+                            .zip(&want)
+                            .map(|(a, b)| a.abs_diff(*b))
+                            .max()
+                            .unwrap_or(0);
+                        let what = format!(
+                            "base {} origin {origin:?} fast {fast} {region:?}",
+                            base as u8
+                        );
+                        assert!(worst <= 1, "{what}: off by {worst}");
+                        assert!(
+                            painted_at(&away, origin, region, fast, true) == got,
+                            "{what}: shared differs"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

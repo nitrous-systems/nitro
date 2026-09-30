@@ -177,8 +177,12 @@ impl Harness {
     }
 
     fn shot(&self) -> Image {
+        self.pixels("shot\n")
+    }
+
+    fn pixels(&self, req: &str) -> Image {
         let mut c = self.connect();
-        c.get_mut().write_all(b"shot\n").unwrap();
+        c.get_mut().write_all(req.as_bytes()).unwrap();
         let mut header = String::new();
         c.read_line(&mut header).unwrap();
         let fields: Vec<u32> = header
@@ -5262,6 +5266,73 @@ fn overview_on_one_output_leaves_the_other_alone() {
     overview(&h, false);
     drop(conn);
     h.quit();
+}
+
+/// A window on an output that is not at the desktop origin is painted at
+/// its output-local position (#3936): the output's region is local, and
+/// the scene's items are global, so the paint has to shift between them.
+#[test]
+fn a_window_on_the_second_output_is_painted_where_it_is() {
+    second_output_pixels("second-px", true);
+}
+
+/// As [`a_window_on_the_second_output_is_painted_where_it_is`], painting
+/// straight into the scanout buffer (`NITRO_SHADOW=0`).
+#[test]
+fn a_window_on_the_second_output_is_painted_where_it_is_without_a_shadow() {
+    second_output_pixels("second-px-direct", false);
+}
+
+fn second_output_pixels(name: &str, shadow: bool) {
+    let mut h = Harness::start_with(name, OUT.0, OUT.1, |c| c.shadow = shadow);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client(name);
+    let mut b = make_window(&mut conn, &mut inbox, 1, "b", WIN, GREEN, 0, 1);
+    assert_eq!(h.request_line("plug 400x300\n"), "ok");
+    wait_for("the second output", || h.stat("outputs") == 2);
+    h.settle();
+    let (bx, by) = b.title_bar();
+    h.drag((bx, by), (OUT.0 as f32 + 150.0, 100.0), OUT);
+    await_configure(&mut conn, &mut inbox, &mut b, "the move");
+    park(&mut h);
+    for req in ["shot Virtual-2\n", "shot-front Virtual-2\n"] {
+        let shot = h.pixels(req);
+        assert_eq!((shot.width, shot.height), (400, 300), "{req:?}");
+        assert_window_at(&shot, &b, req);
+    }
+    drop(conn);
+    h.quit();
+}
+
+/// `b`'s content (output-local) is GREEN in `shot`, and left of its frame is not.
+fn assert_window_at(shot: &Image, b: &Win, what: &str) {
+    // `Configure` positions are output-local; the drag put the content
+    // near local (84, 114) — well inside the 320 columns the old paint
+    // showed the background in.
+    let local = |x: f32, y: f32| (x as u32, y as u32);
+    let (cx, cy) = local(b.pos.x, b.pos.y);
+    let (w, hh) = (b.size.w as u32, b.size.h as u32);
+    for (x, y) in [
+        (cx + 1, cy + 1),
+        (cx + w - 2, cy + 1),
+        (cx + 1, cy + hh - 2),
+        (cx + w / 2, cy + hh / 2),
+    ] {
+        assert_eq!(
+            rgb(shot.pixel(x, y)),
+            to_rgb(GREEN),
+            "{what}: ({x}, {y}) is the window's content"
+        );
+    }
+    // And nothing green outside its frame: left of it is not the window.
+    let f = b.frame(true);
+    let (fx, _) = local(f.x, f.y);
+    assert!(fx > 2, "room left of the frame");
+    assert_ne!(
+        rgb(shot.pixel(fx - 2, cy + hh / 2)),
+        to_rgb(GREEN),
+        "{what}: left of the frame"
+    );
 }
 
 #[test]
