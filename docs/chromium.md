@@ -228,7 +228,6 @@ page load), paint 26 µs. That matches the in-process 1.8 % / 4 frames/s.
 > p50 24.9 / 25.4 ms. Both boxes scroll at 60 Hz, and the scale makes no
 > difference.
 
-
 **Scale 1.25 (the box's usual setting), #3940.** Before #3940, every arm
 was limited by the server rather than by Chromium. At a fractional
 scale, a window at a logical position that is not a multiple of 4 had a
@@ -369,8 +368,8 @@ loaded Mesa driver; #3919's oop GPU process was 30–34 MB.
 `dmabuf_buffers 0`), which is the fallback working, and is listed as such.
 
 **testhost2** (KBL, anv), eDP 2560×1440@60 at **scale 1.25** (#3940 has
-landed; fps halved by the pre-#3953 bench, see §testhost2: really ~62),
-landed), window 1262×1376 px, 2026-09-30:
+landed), window 1262×1376 px, 2026-09-30 (fps halved by the pre-#3953
+bench, see §testhost2: really ~62):
 
 | arm | fps | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
 |---|---|---|---|---|---|---|---|

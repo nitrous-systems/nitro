@@ -124,9 +124,10 @@ modifier) and **scans it out on a plane**:
     only, not +452 as before). Server CPU 3.0 % (was 27–31 % with the
     placeholder), player 5.3 %, helper RSS 13.9 MB. `nitro-shot` still
     shows grey there: it reads the server's shadow, where the video is a
-    hole that `shot` fills with the placeholder colour (#3897). A server started before the #3922 build was
-    installed (a GDM login from earlier) has no helper and still paints
-    the placeholder (`planes_mode 0`, 31 % CPU).
+    hole that `shot` fills with the placeholder colour (#3897). A
+    server started before the #3922 build was installed (a GDM login
+    from earlier) has no helper and still paints the placeholder
+    (`planes_mode 0`, 31 % CPU).
 - **box1 (HSW, i965):** no plane lists NV12, so the server does not
   import Y-tiled NV12 at all. `auto` decodes in software (`fallback="the
   server does not import NV12 with modifier 0x100000000000002"`), and
