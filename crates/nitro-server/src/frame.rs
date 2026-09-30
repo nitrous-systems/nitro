@@ -3383,7 +3383,8 @@ mod overlay_tests {
     fn an_opaque_only_hole_clears_just_the_opaque_region() {
         let mut s = world(Base::Solid, 0.0);
         let win = s.create_window(C, "csd", Size::new(40.0, 30.0), Layer::Normal);
-        s.place_window(win, Some(OUT), Point::new(10.0, 10.0)).unwrap();
+        s.place_window(win, Some(OUT), Point::new(10.0, 10.0))
+            .unwrap();
         let root = s.window_info(win).unwrap().root();
         let desc = BufferDesc::new(40, 30, 160, format::AR24);
         let b = s.create_buffer(C, desc, pixels(40, 30, |_, _| 0)).unwrap();
@@ -3396,10 +3397,15 @@ mod overlay_tests {
         s.set_surface(
             C,
             n,
-            Some(nitro_scene::SurfaceRef::new(b, IRect::new(0, 0, 40, 30), color)),
+            Some(nitro_scene::SurfaceRef::new(
+                b,
+                IRect::new(0, 0, 40, 30),
+                color,
+            )),
         )
         .unwrap();
-        s.set_opaque_region(C, n, &[IRect::new(4, 4, 32, 22)]).unwrap();
+        s.set_opaque_region(C, n, &[IRect::new(4, 4, 32, 22)])
+            .unwrap();
         s.set_surface_on_plane(n, true).unwrap();
         let mut d = Damage::new();
         s.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
@@ -3417,5 +3423,4 @@ mod overlay_tests {
             }
         }
     }
-
 }

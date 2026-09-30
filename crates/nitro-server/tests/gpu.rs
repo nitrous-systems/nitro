@@ -816,10 +816,15 @@ fn a_tiled_ar24_is_composited_while_the_helper_is_and_the_flag_goes_with_it() {
     wait_for("the helper", || h.stat("gpu_state") == 2);
     let x = nitro_gpu::proto::MOD_I915_X_TILED;
     let mut s = translucent(&h, "tiled-ar24", x);
-    let d = expect(&mut s.conn, &mut s.seen, "COMPOSITE feedback", |m| match m {
-        ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
-        _ => None,
-    });
+    let d = expect(
+        &mut s.conn,
+        &mut s.seen,
+        "COMPOSITE feedback",
+        |m| match m {
+            ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
+            _ => None,
+        },
+    );
     assert!(composite_flag(&d, format::AR24, x), "{d:?}");
     assert!(composite_flag(&d, format::AR24, modifier::LINEAR), "{d:?}");
     s.play_a("mode 2", || h.stat("planes_mode") == 2);
@@ -844,10 +849,15 @@ fn a_tiled_ar24_is_composited_while_the_helper_is_and_the_flag_goes_with_it() {
     }
     assert_eq!(h.stat("gpu_state"), 4, "given up");
     s.seen.clear();
-    let d = expect(&mut s.conn, &mut s.seen, "feedback without COMPOSITE", |m| match m {
-        ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
-        _ => None,
-    });
+    let d = expect(
+        &mut s.conn,
+        &mut s.seen,
+        "feedback without COMPOSITE",
+        |m| match m {
+            ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
+            _ => None,
+        },
+    );
     assert!(
         d.formats
             .iter()

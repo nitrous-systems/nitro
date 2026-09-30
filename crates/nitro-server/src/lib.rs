@@ -13260,7 +13260,9 @@ impl Server {
             if self.gpu.refused(content.buffer)
                 || (self.gpu.info.is_some()
                     && !self.gpu.samples(src.desc.fourcc, src.desc.modifier))
-                || !(opaque || (buffer.desc().format == nitro_wire::types::format::AR24 && buffer.premultiplied()))
+                || !(opaque
+                    || (buffer.desc().format == nitro_wire::types::format::AR24
+                        && buffer.premultiplied()))
             {
                 continue;
             }
@@ -13322,8 +13324,17 @@ impl Server {
             if approx {
                 self.gpu.counters.translucent_approx += 1;
             }
-            out.extend(o_region.rects().into_iter().map(|r| layer(r, Blend::Opaque)));
-            out.extend(rest.rects().into_iter().map(|r| layer(r, Blend::PremulOver)));
+            out.extend(
+                o_region
+                    .rects()
+                    .into_iter()
+                    .map(|r| layer(r, Blend::Opaque)),
+            );
+            out.extend(
+                rest.rects()
+                    .into_iter()
+                    .map(|r| layer(r, Blend::PremulOver)),
+            );
         }
         // One layer is the shadow. Whole Surfaces go, bottom first.
         let max = nitro_gpu::proto::MAX_LAYERS - 1;

@@ -321,7 +321,9 @@ fn an_on_plane_translucent_surface_is_an_opaque_only_hole() {
     let mut s = common::scene();
     let n = surface(&mut s);
     let desc = BufferDesc::new(64, 64, 256, u32::from_le_bytes(*b"AR24"));
-    let ar24 = s.create_buffer(CLIENT, desc, vec![0; desc.byte_len()]).unwrap();
+    let ar24 = s
+        .create_buffer(CLIENT, desc, vec![0; desc.byte_len()])
+        .unwrap();
     s.set_surface(CLIENT, n, Some(SurfaceRef::new(ar24, full(), color())))
         .unwrap();
     s.set_surface_on_plane(n, true).unwrap();
