@@ -27,9 +27,7 @@ use nitro_server::{BackendKind, Config, config::GpuHelper, run};
 use nitro_shm::MappingMut;
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{Configure, CreateDmabufBuffer, DmabufPlane, PresentSurface, ServerMsg};
-use nitro_wire::types::{
-    BufferId, ColorMatrix, ColorRange, Layer, NodeId, caps, format, modifier,
-};
+use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, Layer, NodeId, caps, format, modifier};
 
 const OUT: (u32, u32) = (320, 240);
 const SIDE: u32 = 32;
@@ -425,7 +423,12 @@ fn a_linear_dmabuf_on_a_plane_shows_its_pixels_not_the_hole() {
     onto_the_overlay(&h, &mut conn, &mut seen, &[10, 11]);
     let s = h.shot("shot meta=1\n");
     assert_eq!(
-        (s.m("surfaces"), s.m("cpu"), s.m("helper"), s.m("placeholder")),
+        (
+            s.m("surfaces"),
+            s.m("cpu"),
+            s.m("helper"),
+            s.m("placeholder")
+        ),
         ("1", "1", "0", "0")
     );
     assert_eq!(s.m("reason"), "none");
@@ -482,10 +485,19 @@ fn a_tiled_buffer_goes_through_the_helper_capture_and_nothing_stays() {
     let h = Harness::start("tiled", GpuHelper::On);
     wait_for("the helper", || h.stat("gpu_state") == 2);
     let (_conn, _seen, c) = tiled_on_the_overlay(&h);
-    assert_eq!(h.stat("gpu_textures"), 0, "on a plane: the helper holds nothing");
+    assert_eq!(
+        h.stat("gpu_textures"),
+        0,
+        "on a plane: the helper holds nothing"
+    );
     let s = h.shot("shot meta=1\n");
     assert_eq!(
-        (s.m("surfaces"), s.m("cpu"), s.m("helper"), s.m("placeholder")),
+        (
+            s.m("surfaces"),
+            s.m("cpu"),
+            s.m("helper"),
+            s.m("placeholder")
+        ),
         ("1", "0", "1", "0")
     );
     assert!(

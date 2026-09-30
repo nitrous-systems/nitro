@@ -159,15 +159,15 @@ fn parse_header(header: &str) -> Option<(u32, u32, u32, Meta)> {
     let mut num = || words.next()?.parse::<u32>().ok();
     let (w, h, stride) = (num()?, num()?, num()?);
     let meta = words
-        .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        })
         .collect::<Option<_>>()?;
     Some((w, h, stride, meta))
 }
 
-fn read_shot(
-    conn: &mut BufReader<UnixStream>,
-    header: &str,
-) -> io::Result<(Shot, Meta)> {
+fn read_shot(conn: &mut BufReader<UnixStream>, header: &str) -> io::Result<(Shot, Meta)> {
     let (width, height, stride, meta) = parse_header(header)
         .ok_or_else(|| io::Error::other(format!("bad shot header {header:?}")))?;
     let mut data = vec![0u8; (stride as usize) * (height as usize)];

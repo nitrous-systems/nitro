@@ -484,13 +484,24 @@ mod tests {
         };
         assert!(capture(40, 30, &[layer], t).is_ok());
         assert!(capture(40, 30, &[], t).is_ok());
-        assert_eq!(capture(0, 30, &[layer], t).unwrap_err().code, ErrorCode::BadRect);
-        assert_eq!(capture(20, 20, &[layer], t).unwrap_err().code, ErrorCode::BadRect);
         assert_eq!(
-            capture(40, 30, &[Layer { tex: 9, ..layer }], t).unwrap_err().code,
+            capture(0, 30, &[layer], t).unwrap_err().code,
+            ErrorCode::BadRect
+        );
+        assert_eq!(
+            capture(20, 20, &[layer], t).unwrap_err().code,
+            ErrorCode::BadRect
+        );
+        assert_eq!(
+            capture(40, 30, &[Layer { tex: 9, ..layer }], t)
+                .unwrap_err()
+                .code,
             ErrorCode::BadId
         );
         let many = vec![layer; MAX_LAYERS + 1];
-        assert_eq!(capture(40, 30, &many, t).unwrap_err().code, ErrorCode::TooMany);
+        assert_eq!(
+            capture(40, 30, &many, t).unwrap_err().code,
+            ErrorCode::TooMany
+        );
     }
 }

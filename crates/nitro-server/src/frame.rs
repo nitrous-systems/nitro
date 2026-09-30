@@ -116,8 +116,8 @@ use nitro_raster::{
     YuvEncoding, YuvMatrix, YuvRange,
 };
 use nitro_scene::{
-    ColorMatrix as SceneColorMatrix, ColorRange as SceneColorRange, Fill as SceneFill, OutputId,
-    BufferKey, PaintItem, PaintKind, Scene, SurfaceColor,
+    BufferKey, ColorMatrix as SceneColorMatrix, ColorRange as SceneColorRange, Fill as SceneFill,
+    OutputId, PaintItem, PaintKind, Scene, SurfaceColor,
 };
 use nitro_wire::types::format;
 

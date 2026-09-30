@@ -596,7 +596,15 @@ fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
         },
         vec![],
     ) {
-        (FromHelper::Captured { serial: 5, w: cw, h: ch, stride }, mut fds) => {
+        (
+            FromHelper::Captured {
+                serial: 5,
+                w: cw,
+                h: ch,
+                stride,
+            },
+            mut fds,
+        ) => {
             assert_eq!((cw, ch), (w, ht));
             let len = stride as usize * ch as usize;
             let map = nitro_shm::Mapping::map(fds.pop().unwrap(), len).unwrap();

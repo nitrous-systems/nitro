@@ -110,7 +110,9 @@ impl Server {
             o.kms_id == id && o.shadow.as_ref().is_some_and(frame::Shadow::is_complete)
         });
         let scene_id = index.map(|i| self.outputs[i].scene_id);
-        let orect = scene_id.and_then(|s| self.scene.output_info(s)).map(|(r, _)| r);
+        let orect = scene_id
+            .and_then(|s| self.scene.output_info(s))
+            .map(|(r, _)| r);
         let (Some(index), Some(scene_id), Some(orect)) = (index, scene_id, orect) else {
             // No shadow to repaint (yet): the front buffer, holes grey.
             let meta = ShotMeta::default();
@@ -347,10 +349,7 @@ impl Server {
         let mut layers = Vec::with_capacity(p.cands.len());
         for c in std::mem::take(&mut p.cands) {
             let had = self.gpu.has_tex(c.key);
-            let Some(tex) = self
-                .gpu
-                .texture(&poll, TOK_GPU, c.key, c.encoding, c.range)
-            else {
+            let Some(tex) = self.gpu.texture(&poll, TOK_GPU, c.key, c.encoding, c.range) else {
                 let r = if self.gpu.refused(c.key) {
                     ShotReason::HelperRefused
                 } else {
@@ -476,7 +475,12 @@ impl Server {
     }
 
     /// The helper answered a shot's capture.
-    pub(crate) fn shot_captured(&mut self, serial: u64, (w, h, stride): (u32, u32, u32), memfd: OwnedFd) {
+    pub(crate) fn shot_captured(
+        &mut self,
+        serial: u64,
+        (w, h, stride): (u32, u32, u32),
+        memfd: OwnedFd,
+    ) {
         let Some(i) = self
             .shots
             .pending
@@ -488,7 +492,8 @@ impl Server {
         let mut p = self.shots.pending.remove(i);
         self.shot_release(&p);
         let token = p.token;
-        let fits = (w, h) == (p.image.width, p.image.height) && u64::from(stride) >= u64::from(w) * 4;
+        let fits =
+            (w, h) == (p.image.width, p.image.height) && u64::from(stride) >= u64::from(w) * 4;
         let map = fits
             .then(|| nitro_shm::Mapping::map(memfd, stride as usize * h as usize).ok())
             .flatten();

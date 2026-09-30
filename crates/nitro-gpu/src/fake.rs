@@ -14,8 +14,7 @@ use nitro_core::IRect;
 use crate::backend::{Backend, BackendError, Readback, Ring, RingRequest};
 use crate::proto::{
     AR24, DeviceInfo, DmabufDesc, FormatMod, Layer, MOD_I915_X_TILED, MOD_I915_Y_TILED, MOD_LINEAR,
-    NV12, ShadowDesc,
-    ShadowPath, SlotLayout, XR24,
+    NV12, ShadowDesc, ShadowPath, SlotLayout, XR24,
 };
 
 /// One recorded backend call.
@@ -243,7 +242,11 @@ impl Backend for FakeBackend {
         h: u32,
         layers: &[(&u32, Layer)],
     ) -> Result<Readback, BackendError> {
-        self.record(Call::Capture(w, h, layers.iter().map(|(t, _)| **t).collect()));
+        self.record(Call::Capture(
+            w,
+            h,
+            layers.iter().map(|(t, _)| **t).collect(),
+        ));
         if std::mem::take(&mut self.state().fail_next_capture) {
             return Err(err("fake capture failure"));
         }
