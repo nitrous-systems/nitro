@@ -409,6 +409,9 @@ did not happen.
   gets a tiled XR24 buffer that goes on a plane: 0.8 ms and
   `planes_mode 1`. Making the CSD window's opaque part tiled (or the
   helper compositing `AR24`, #3922) is the next lever.
+  **#3952 did it:** see [Translucent window through the GPU
+  helper](#translucent-window-through-the-gpu-helper-3952), 0 ms server
+  paint.
 - **Memory:** the GPU process is +35 MB PSS on testhost2 and +65–70 MB on
   box1 against shm, the Mesa/ANGLE-Vulkan driver state; the tree +20–70 MB.
 - **CPU during 1080p video:** see [Video overlays](#video-overlays-3944)
@@ -523,6 +526,47 @@ composited by viz with no errors, and the two arms match:
   placeholder (`honest()` in the server). Correct placement was checked
   from `planes_in_use`/`plane_flips` and the node geometry, not from a
   shot.
+
+### Translucent window through the GPU helper (#3952)
+
+The server advertises the helper's sampleable AR24 pairs with
+`dmabuf_flags::COMPOSITE`, so the translucent (CSD) window allocates
+**tiled** AR24. In `nitro_surface_factory.cc`, a translucent window takes
+pairs flagged `kCpu` or `kComposite`, for the fourcc it really allocates;
+before, it filtered on XR24 while allocating AR24. The server composites
+it in mode 2: the declared opaque region goes under the shadow, and the
+rounded corners and ring go `PremulOver` above it (`docs/surfaces.md`).
+When the flag changes (helper given up, `gpu.helper = off`), Chromium
+completes the next swap with `SWAP_NAK_RECREATE_BUFFERS` and viz
+reallocates. This is in `GbmSurfacelessNitro`, driven by a generation
+counter that `OnDmabufFeedback` bumps.
+
+**testhost2** (KBL, anv), scale 1.25, window 1262×1376, 2026-09-30,
+`just box=testhost2 chromium-bench dmabuf`. The bench now also prints
+server CPU over the scroll:
+
+| arm | fps | server i2p mean | server paint mean | server CPU | planes_mode | GPU proc PSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|---|
+| **dmabuf, helper on** (X-tiled AR24) | 61.0–61.4 | 19.6–20.8 ms | **0.00 ms** | **7 %** | **2** | 68–69 MB | 529–541 MB | 62–66 % |
+| dmabuf, `gpu.helper = off` (linear AR24, CPU blend) | 61.4–61.6 | 23.9–25.0 ms (p50 24.5–25.0) | 2.71–2.96 ms | 24–33 % | 0 | 71 MB | 532–533 MB | 62–87 % |
+
+**Reading:**
+
+- **The window really is tiled.** The kernel's framebuffer list during
+  the run showed the window's three 1262×1376 AR24 framebuffers with
+  modifier `I915_X_TILED`.
+- **No placeholder, no approximation in this run.**
+  `dmabuf_placeholder_paints` did not move, and `gpu_translucent_approx`
+  stayed 0 (no menu was open).
+- **Where the gain goes.** Server paint drops from ~3 ms to 0 and server
+  CPU to about a quarter. i2p falls by ~5 ms, because the server no
+  longer blends before the commit.
+- **The fallback still works.** The `helper off` arm reproduces #3921's
+  2.71–2.96 ms exactly.
+- **Pixel test.** `nitro-gpu-vulkan` test `case2b` (a premultiplied AR24
+  dma-buf over the shadow, exact result) passes on the KBL GPU.
+- **Corners not checked by eye.** `nitro-shot` does not capture helper
+  content (#3962), so there is no screenshot of the rounded corners.
 
 ## Other gotchas
 
