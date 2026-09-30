@@ -332,22 +332,38 @@ fn kms_rect(r: IRect) -> KmsRect {
     )
 }
 
+/// Why a plane cannot take a candidate at all (before any test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reject {
+    /// Format or modifier not listed.
+    Format,
+    /// The plane does not scale, or not that far down ([`MIN_SCALE_PCT`]).
+    Scale,
+    /// A colour property the plane lacks.
+    Color,
+}
+
 /// `c` on `p`, if the plane can take it at all: format and modifier
 /// listed, scale within the rule, colour properties available. `None`
 /// means "not worth a test".
 fn config(c: &Candidate, p: &PlaneInfo) -> Option<PlaneConfig> {
+    check(c, p).ok()
+}
+
+/// [`config`] with the reason for a refusal.
+fn check(c: &Candidate, p: &PlaneInfo) -> Result<PlaneConfig, Reject> {
     if !p.supports(c.format, c.modifier) {
-        return None;
+        return Err(Reject::Format);
     }
     let dst = kms_rect(c.dst);
     let mut cfg = PlaneConfig::new(p.id, PlaneSource::Buffer(c.buffer), c.src, dst);
     if cfg.assignment(None).scales() {
         if p.scaling == Some(false) || c.src.w == 0 || c.src.h == 0 {
-            return None;
+            return Err(Reject::Scale);
         }
         let pct = |d: u32, s: u32| (u64::from(d) << 16) * 100 / u64::from(s);
         if pct(dst.w, c.src.w) < MIN_SCALE_PCT || pct(dst.h, c.src.h) < MIN_SCALE_PCT {
-            return None;
+            return Err(Reject::Scale);
         }
     }
     if c.format.is_yuv() {
@@ -356,24 +372,56 @@ fn config(c: &Candidate, p: &PlaneInfo) -> Option<PlaneConfig> {
         // BT.601 limited: fine for exactly that and nothing else.
         if p.color_encodings.is_empty() {
             if e != ColorEncoding::Bt601 {
-                return None;
+                return Err(Reject::Color);
             }
         } else if p.has_encoding(e) {
             cfg.color_encoding = Some(e);
         } else {
-            return None;
+            return Err(Reject::Color);
         }
         if p.color_ranges.is_empty() {
             if r != ColorRange::Limited {
-                return None;
+                return Err(Reject::Color);
             }
         } else if p.has_range(r) {
             cfg.color_range = Some(r);
         } else {
-            return None;
+            return Err(Reject::Color);
         }
     }
-    Some(cfg)
+    Ok(cfg)
+}
+
+/// Whether `c` is off every plane because of the scaling rule alone: no
+/// non-cursor plane takes it, and at least one refuses it only for its
+/// size (#3956). A format no plane lists is not a scale limit.
+#[must_use]
+pub fn scale_limited(c: &Candidate, planes: &[PlaneInfo]) -> bool {
+    let mut scale = false;
+    for p in planes.iter().filter(|p| p.kind != PlaneKind::Cursor) {
+        match check(c, p) {
+            Ok(_) => return false,
+            Err(Reject::Scale) => scale = true,
+            Err(_) => {}
+        }
+    }
+    scale
+}
+
+/// The smallest `dst / src` ratio, in percent, a plane of this output
+/// takes (`SurfacePlaneHint::min_scale_pct`, #3956): [`MIN_SCALE_PCT`]
+/// when some non-cursor plane may scale (unknown counts as may), 100 when
+/// none does, 0 when there are no planes to scan a Surface out on.
+#[must_use]
+pub fn min_scale_pct(planes: &[PlaneInfo]) -> u8 {
+    let mut any = false;
+    for p in planes.iter().filter(|p| p.kind != PlaneKind::Cursor) {
+        any = true;
+        if p.scaling != Some(false) {
+            return MIN_SCALE_PCT as u8;
+        }
+    }
+    if any { 100 } else { 0 }
 }
 
 fn zpos(p: &PlaneInfo) -> u64 {
@@ -1042,6 +1090,30 @@ mod tests {
         let before = r.be.test_log().len();
         assert_eq!(r.search(&[c]), Decision::default());
         assert_eq!(r.be.test_log().len(), before, "pre-filtered");
+    }
+
+    #[test]
+    fn scale_limits_are_told_apart_from_other_rejects() {
+        let mut r = Rig::new(kbl());
+        // 1920×1080 into 1600×900-ish: 0.83×, under the 94 % rule.
+        let big = r.cand(1, Fourcc::NV12, (384, 216), IRect::new(0, 0, 320, 180));
+        assert!(scale_limited(&big, &r.planes));
+        // 0.95×: a plane takes it.
+        let ok = r.cand(2, Fourcc::NV12, (336, 190), IRect::new(0, 0, 320, 180));
+        assert!(!scale_limited(&ok, &r.planes));
+        // A modifier no plane lists is a format reject, not a scale one.
+        let mut tiled = r.cand(3, Fourcc::NV12, (384, 216), IRect::new(0, 0, 320, 180));
+        tiled.modifier = nitro_wire::types::modifier::I915_Y_TILED;
+        assert!(!scale_limited(&tiled, &r.planes));
+        assert_eq!(min_scale_pct(&r.planes), 94);
+
+        // HSW: nothing scales; a scaled YUYV is scale-limited.
+        let r2 = Rig::new(hsw());
+        assert_eq!(min_scale_pct(&r2.planes), 100);
+        let mut r2 = r2;
+        let y = r2.cand(1, Fourcc::YUYV, (160, 90), window());
+        assert!(scale_limited(&y, &r2.planes));
+        assert_eq!(min_scale_pct(&[]), 0);
     }
 
     #[test]

@@ -3357,6 +3357,34 @@ fixed_msg! {
         height: u32,
     }
 
+    /// How a `Surface` node's buffer fits the display planes (needs
+    /// [`caps::PLANE_HINT`](crate::types::caps::PLANE_HINT) listed; #3956).
+    ///
+    /// `width`/`height` are the node's device-pixel size, as in
+    /// [`SurfaceHint`]. `min_scale_pct` is the smallest destination/source
+    /// ratio a display plane on the node's output takes without the
+    /// server compositing: 100 when no plane scales, 0 when the output has
+    /// no usable planes (size then does not matter for scanout). A
+    /// producer whose source is larger than `width·100/min_scale_pct`
+    /// should render at `width`×`height` (keeping its aspect ratio) so a
+    /// plane takes it. `flags` bit 0 (`SCALE_LIMITED`): the node's current
+    /// buffer is off the planes *because of* that limit. Informational
+    /// only — a producer decides from the size and the ratio, never from
+    /// the flag, so there is no feedback loop. Sent when the node first
+    /// has a device rect and whenever any field changes.
+    SurfacePlaneHint {
+        /// The surface node.
+        id: NodeId,
+        /// The node's width in device pixels.
+        width: u32,
+        /// The node's height in device pixels.
+        height: u32,
+        /// Smallest dst/src ratio a plane takes, in percent (0 = no planes).
+        min_scale_pct: u8,
+        /// `plane_hint_flags` bits.
+        flags: u8,
+    }
+
     /// Answer to [`ExportSurface`]: the node's share token (needs
     /// [`caps::SHARE`](crate::types::caps::SHARE)).
     SurfaceExported {
@@ -3577,6 +3605,8 @@ msg_enum! {
         AllocSurfaceBuffersFailed = 0x830a,
         /// Importable dma-buf formats/modifiers (needs `caps::DMABUF`).
         DmabufFeedback = 0x830b,
+        /// A surface's plane-fit hint (needs `caps::PLANE_HINT`).
+        SurfacePlaneHint = 0x830c,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

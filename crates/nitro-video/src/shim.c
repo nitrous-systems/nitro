@@ -17,6 +17,9 @@
  *               as an NV12 dma-buf (fds, offsets, pitches) the first time
  *               that surface is seen
  *   nv_release  give a held VA surface back to the decoder's pool
+ *   nv_set_scale  VA-API only: scale every frame to w x h on the video
+ *               engine (VPP) before export, or stop (0 x 0); #3956
+ *   nv_take_scale_error  why VPP stopped mid-stream, once
  *   nv_close    free everything
  *
  * VA-API (#3923): `AV_HWDEVICE_TYPE_VAAPI` on a render node, frames stay
@@ -28,6 +31,14 @@
  * `nv_open` fail with `*unsupported = 1`, and the caller opens the file
  * again in software. To find that out without a seek, `nv_open` decodes
  * the first frame and keeps it pending for the first `nv_next*`.
+ *
+ * VPP (#3956): with nv_set_scale on, each decoded surface goes through one
+ * VAProcPipelineParameterBuffer pass (libva directly, not libavfilter --
+ * libva is already mapped through libavutil's VAAPI hwcontext) into a
+ * small fixed pool of w x h NV12 surfaces, and the decoded surface goes
+ * straight back to the decoder. Same matrix and range in and out: a
+ * scale, no colour conversion. The pool is new frames context, so its
+ * keys get a new generation like any mid-stream pool change.
  *
  * No libswscale: the software decoders nitro-video meets output 8-bit
  * 4:2:0 (yuv420p, yuvj420p) or NV12 already, and interleaving chroma is
@@ -42,6 +53,9 @@
 #include <libavutil/avutil.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/hwcontext_vaapi.h>
+#include <va/va.h>
+#include <va/va_vpp.h>
 #include <libavutil/pixdesc.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -88,6 +102,12 @@ typedef struct nv_ctx {
         uint32_t key;
         AVFrame *f;
     } held[NV_MAX_HELD];
+    /* VPP scaling (#3956): the output pool, its VA context, the size. */
+    AVBufferRef *scale_frames;
+    VAConfigID vpp_cfg;
+    VAContextID vpp_ctx;
+    int scale_w, scale_h;
+    char scale_err[160]; /* set when VPP failed mid-stream */
 } nv_ctx;
 
 static void set_err(char *err, int errlen, const char *what, int code) {
@@ -101,9 +121,12 @@ static void set_err(char *err, int errlen, const char *what, int code) {
     }
 }
 
+static void scale_off(nv_ctx *c);
+
 void nv_close(nv_ctx *c) {
     if (!c) return;
     for (int i = 0; i < NV_MAX_HELD; i++) av_frame_free(&c->held[i].f);
+    scale_off(c);
     av_frame_free(&c->pending);
     av_frame_free(&c->sw);
     av_buffer_unref(&c->frames_ref);
@@ -530,6 +553,157 @@ static int export_drm(const AVFrame *f, int fds[4], uint32_t offsets[4], uint32_
     return 0;
 }
 
+static VADisplay va_display(const nv_ctx *c) {
+    const AVHWDeviceContext *d = (const AVHWDeviceContext *)c->hw_dev->data;
+    return ((const AVVAAPIDeviceContext *)d->hwctx)->display;
+}
+
+static void scale_off(nv_ctx *c) {
+    if (!c->scale_frames) return;
+    VADisplay dpy = va_display(c);
+    if (c->vpp_ctx != VA_INVALID_ID) vaDestroyContext(dpy, c->vpp_ctx);
+    if (c->vpp_cfg != VA_INVALID_ID) vaDestroyConfig(dpy, c->vpp_cfg);
+    c->vpp_ctx = VA_INVALID_ID;
+    c->vpp_cfg = VA_INVALID_ID;
+    /* Frames still held keep the pool alive through their own refs. */
+    av_buffer_unref(&c->scale_frames);
+    c->scale_w = c->scale_h = 0;
+}
+
+static void set_va_err(char *err, int errlen, const char *what, VAStatus st) {
+    char msg[160];
+    snprintf(msg, sizeof msg, "%s: %s", what, vaErrorStr(st));
+    set_err(err, errlen, msg, 0);
+}
+
+/* The VPP colour standard of the stream (unspecified: BT.709 from 720
+ * lines, like the player's guess). */
+static VAProcColorStandardType va_standard(const nv_ctx *c) {
+    switch (c->dec->colorspace) {
+    case AVCOL_SPC_BT709: return VAProcColorStandardBT709;
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M: return VAProcColorStandardBT601;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL: return VAProcColorStandardBT2020;
+    default: return c->dec->height >= 720 ? VAProcColorStandardBT709 : VAProcColorStandardBT601;
+    }
+}
+
+/* Scale every VA frame to w x h (even) from now on, into a fixed pool of
+ * `pool` surfaces; 0 x 0 stops. 0, or -1 with `err` (scaling is then
+ * off: frames stay native). */
+int nv_set_scale(nv_ctx *c, int w, int h, int pool, char *err, int errlen) {
+    if (!c->hw) {
+        set_err(err, errlen, "software decode has no VPP", 0);
+        return -1;
+    }
+    if (w == c->scale_w && h == c->scale_h && (w == 0 || c->scale_frames)) return 0;
+    scale_off(c);
+    if (w <= 0 || h <= 0) return 0;
+    w &= ~1;
+    h &= ~1;
+    AVBufferRef *ref = av_hwframe_ctx_alloc(c->hw_dev);
+    if (!ref) {
+        set_err(err, errlen, "out of memory", 0);
+        return -1;
+    }
+    AVHWFramesContext *fc = (AVHWFramesContext *)ref->data;
+    fc->format = AV_PIX_FMT_VAAPI;
+    fc->sw_format = AV_PIX_FMT_NV12;
+    fc->width = w;
+    fc->height = h;
+    fc->initial_pool_size = pool; /* fixed: the context needs the ids */
+    int r = av_hwframe_ctx_init(ref);
+    if (r < 0) {
+        set_err(err, errlen, "allocating the VPP surfaces", r);
+        av_buffer_unref(&ref);
+        return -1;
+    }
+    const AVVAAPIFramesContext *vf = fc->hwctx;
+    VADisplay dpy = va_display(c);
+    c->vpp_cfg = VA_INVALID_ID;
+    c->vpp_ctx = VA_INVALID_ID;
+    c->scale_frames = ref;
+    VAStatus st = vaCreateConfig(dpy, VAProfileNone, VAEntrypointVideoProc, NULL, 0, &c->vpp_cfg);
+    if (st != VA_STATUS_SUCCESS) {
+        c->vpp_cfg = VA_INVALID_ID;
+        set_va_err(err, errlen, "no VA-API video processing", st);
+        scale_off(c);
+        return -1;
+    }
+    st = vaCreateContext(dpy, c->vpp_cfg, w, h, VA_PROGRESSIVE, vf->surface_ids, vf->nb_surfaces,
+                         &c->vpp_ctx);
+    if (st != VA_STATUS_SUCCESS) {
+        c->vpp_ctx = VA_INVALID_ID;
+        set_va_err(err, errlen, "creating the VPP context", st);
+        scale_off(c);
+        return -1;
+    }
+    c->scale_w = w;
+    c->scale_h = h;
+    return 0;
+}
+
+/* One VPP pass: `in` scaled into a fresh surface of the scale pool. */
+static int vpp(nv_ctx *c, const AVFrame *in, AVFrame *out) {
+    int r = av_hwframe_get_buffer(c->scale_frames, out, 0);
+    if (r < 0) {
+        set_err(c->scale_err, sizeof c->scale_err, "the VPP pool is exhausted", r);
+        return -1;
+    }
+    VADisplay dpy = va_display(c);
+    VASurfaceID src = (VASurfaceID)(uintptr_t)in->data[3];
+    VASurfaceID dst = (VASurfaceID)(uintptr_t)out->data[3];
+    VARectangle from = {0, 0, (uint16_t)in->width, (uint16_t)in->height};
+    VARectangle to = {0, 0, (uint16_t)c->scale_w, (uint16_t)c->scale_h};
+    VAProcPipelineParameterBuffer p;
+    memset(&p, 0, sizeof p);
+    p.surface = src;
+    p.surface_region = &from;
+    p.output_region = &to;
+    p.output_background_color = 0xff000000;
+    p.filter_flags = VA_FRAME_PICTURE | VA_FILTER_SCALING_DEFAULT;
+    VAProcColorStandardType std = va_standard(c);
+    p.surface_color_standard = std;
+    p.output_color_standard = std;
+    uint8_t range = c->dec->color_range == AVCOL_RANGE_JPEG ? VA_SOURCE_RANGE_FULL
+                                                            : VA_SOURCE_RANGE_REDUCED;
+    p.input_color_properties.color_range = range;
+    p.output_color_properties.color_range = range;
+    VABufferID buf = VA_INVALID_ID;
+    VAStatus st = vaBeginPicture(dpy, c->vpp_ctx, dst);
+    if (st == VA_STATUS_SUCCESS) {
+        st = vaCreateBuffer(dpy, c->vpp_ctx, VAProcPipelineParameterBufferType, sizeof p, 1, &p,
+                            &buf);
+        if (st == VA_STATUS_SUCCESS) st = vaRenderPicture(dpy, c->vpp_ctx, &buf, 1);
+        VAStatus end = vaEndPicture(dpy, c->vpp_ctx);
+        if (st == VA_STATUS_SUCCESS) st = end;
+        if (buf != VA_INVALID_ID) vaDestroyBuffer(dpy, buf);
+    }
+    if (st != VA_STATUS_SUCCESS) {
+        set_va_err(c->scale_err, sizeof c->scale_err, "VPP scaling failed", st);
+        av_frame_unref(out);
+        return -1;
+    }
+    r = av_frame_copy_props(out, in);
+    if (r < 0) {
+        set_err(c->scale_err, sizeof c->scale_err, "copying frame properties", r);
+        av_frame_unref(out);
+        return -1;
+    }
+    out->width = c->scale_w;
+    out->height = c->scale_h;
+    return 0;
+}
+
+/* Why VPP scaling stopped by itself (1, once, with `err`), or 0. */
+int nv_take_scale_error(nv_ctx *c, char *err, int errlen) {
+    if (!c->scale_err[0]) return 0;
+    set_err(err, errlen, c->scale_err, 0);
+    c->scale_err[0] = 0;
+    return 1;
+}
+
 /* VA-API: the next frame as a held surface. 1: a frame (its key, size,
  * pts, and n planes of fresh CLOEXEC fds the caller owns); 0: end; <0:
  * error. The surface stays out of the decoder's pool until nv_release. */
@@ -560,6 +734,17 @@ int nv_next_hw(nv_ctx *c, int64_t *pts_us, uint32_t *key, int *width, int *heigh
         set_err(err, errlen, "the decoder left VA-API mid-stream", 0);
         av_frame_free(&f);
         return -1;
+    }
+    if (c->scale_frames) {
+        AVFrame *out = av_frame_alloc();
+        int vr = out ? vpp(c, f, out) : -1;
+        if (vr == 0) {
+            av_frame_free(&f); /* the decoded surface goes straight back */
+            f = out;
+        } else {
+            av_frame_free(&out);
+            scale_off(c); /* keep playing, native; nv_take_scale_error says why */
+        }
     }
     /* A new frames pool (mid-stream re-init): its surface ids start over,
      * so keys get a new generation. */

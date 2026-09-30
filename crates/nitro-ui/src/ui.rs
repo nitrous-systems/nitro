@@ -2009,7 +2009,7 @@ impl<S: 'static> Ui<S> {
         } else {
             0
         } | if self.dmabuf_wanted {
-            nitro_wire::types::caps::DMABUF
+            nitro_wire::types::caps::DMABUF | nitro_wire::types::caps::PLANE_HINT
         } else {
             0
         };
@@ -3236,6 +3236,7 @@ impl<S: 'static> Ui<S> {
             | ServerMsg::BufferReleased(_)
             | ServerMsg::SurfaceHint(_)
             | ServerMsg::DmabufFeedback(_)
+            | ServerMsg::SurfacePlaneHint(_)
             | ServerMsg::WindowState(_) => self.dispatch_surface_msg(state, msg),
             ServerMsg::Error(e) => self.server_error(e),
             // The clipboard; see `crate::clipboard`.
@@ -3267,6 +3268,17 @@ impl<S: 'static> Ui<S> {
                     format: h.format,
                     width: h.width,
                     height: h.height,
+                },
+            ),
+            ServerMsg::SurfacePlaneHint(h) => self.dispatch_surface(
+                state,
+                &crate::surface::SurfaceEvent::PlaneHint {
+                    node: h.id,
+                    width: h.width,
+                    height: h.height,
+                    min_scale_pct: h.min_scale_pct,
+                    scale_limited: h.flags & nitro_wire::types::plane_hint_flags::SCALE_LIMITED
+                        != 0,
                 },
             ),
             ServerMsg::DmabufFeedback(f) => {
@@ -4472,7 +4484,9 @@ impl<S: 'static> Ui<S> {
     }
 
     /// Ask for client dma-bufs too (#3918): implies
-    /// [`Ui::enable_surfaces`] and adds `caps::DMABUF` to `ClientCaps`.
+    /// [`Ui::enable_surfaces`] and adds `caps::DMABUF` (and `PLANE_HINT`,
+    /// #3956: [`SurfaceEvent::PlaneHint`](crate::surface::SurfaceEvent::PlaneHint))
+    /// to `ClientCaps`.
     /// The server then sends the default
     /// [`DmabufFeedback`](nitro_wire::msg::DmabufFeedback), announced as
     /// [`SurfaceEvent::Feedback`](crate::surface::SurfaceEvent::Feedback)

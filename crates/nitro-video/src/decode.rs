@@ -125,6 +125,11 @@ pub struct DmabufPlane {
 /// What registering a decoder surface needs: an NV12 dma-buf layout.
 #[derive(Debug)]
 pub struct DmabufDesc {
+    /// The surface's width in pixels: the stream's, or the VPP scale
+    /// target's (#3956).
+    pub width: u32,
+    /// The surface's height in pixels.
+    pub height: u32,
     /// DRM format modifier (tiling).
     pub modifier: u64,
     /// Luma, then interleaved chroma.
@@ -299,6 +304,78 @@ pub trait Decoder: Send {
     fn release(&mut self, key: u32) {
         let _ = key;
     }
+
+    /// Scale every later [`Decoder::next_dmabuf`] frame to `size` (even,
+    /// no larger than the stream) on the GPU's video engine, or stop
+    /// (`None`), #3956. Scaled frames come from a new pool: new keys.
+    ///
+    /// # Errors
+    /// Why not (then frames stay native); the default cannot scale.
+    fn set_scale(&mut self, size: Option<(u32, u32)>) -> Result<(), String> {
+        match size {
+            None => Ok(()),
+            Some(_) => Err("this decoder cannot scale".to_owned()),
+        }
+    }
+
+    /// Why scaling stopped by itself mid-stream (frames are native
+    /// again), once.
+    fn take_scale_error(&mut self) -> Option<String> {
+        None
+    }
+}
+
+/// Scale-pool surfaces: what the decode thread holds out ([`crate::player::RING`])
+/// plus the one being filled.
+pub const SCALE_POOL: usize = crate::player::RING + 1;
+
+/// Upscale a plane may absorb before a rescale is worth it, percent: a
+/// window grown by up to this much keeps its scaled size (#3956).
+pub const SCALE_KEEP_UP_PCT: u64 = 110;
+
+/// The size to have the decoder scale to (#3956), or `None` for native.
+///
+/// `src` is the stream, `hint` the Surface's device-pixel size from
+/// `SurfacePlaneHint`, `min_pct` the plane's downscale floor (0: no
+/// planes, so size does not matter), `current` what is scaled to now.
+/// The target keeps the stream's aspect inside `hint`, rounded to even.
+/// Scale only when the plane could not take the stream as it is (never
+/// upscale; a plane takes that). Hysteresis: `current` is kept while the
+/// plane can take it to the hinted size — downscale to the floor, upscale
+/// to [`SCALE_KEEP_UP_PCT`] — so a window drag does not reallocate the
+/// pool at every step.
+#[must_use]
+pub fn scale_target(
+    src: (u32, u32),
+    hint: (u32, u32),
+    min_pct: u8,
+    current: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let (sw, sh) = (u64::from(src.0.max(1)), u64::from(src.1.max(1)));
+    let (hw, hh) = (u64::from(hint.0), u64::from(hint.1));
+    if min_pct == 0 || hw == 0 || hh == 0 {
+        return None;
+    }
+    let min = u64::from(min_pct);
+    // The stream's aspect inside the hint.
+    let (fw, fh) = if sw * hh > hw * sh {
+        (hw, (hw * sh + sw / 2) / sw)
+    } else {
+        ((hh * sw + sh / 2) / sh, hh)
+    };
+    let (fw, fh) = (fw.min(sw), fh.min(sh));
+    if fw * 100 >= sw * min && fh * 100 >= sh * min {
+        return None;
+    }
+    if let Some((cw, ch)) = current {
+        let (cw, ch) = (u64::from(cw), u64::from(ch));
+        let keeps = |f: u64, c: u64| f * 100 >= c * min && f * 100 <= c * SCALE_KEEP_UP_PCT;
+        if keeps(fw, cw) && keeps(fh, ch) {
+            return current;
+        }
+    }
+    let even = |v: u64| u32::try_from((v & !1).max(2)).unwrap_or(u32::MAX);
+    Some((even(fw), even(fh)))
 }
 
 /// A decoder that makes its frames up: a luma ramp whose level is the
@@ -327,6 +404,14 @@ struct SynthHw {
     /// Where the round-robin search for a free surface starts, so every
     /// surface of the pool gets used, as a real decoder's might.
     cursor: usize,
+    /// The pool's size (the stream's, or the scale target's).
+    size: (u32, u32),
+    /// Pool generation, the key's top byte, as the shim's.
+    pool_gen: u32,
+    /// Native pool size, restored by `set_scale(None)`.
+    native_pool: usize,
+    /// `set_scale` calls that took effect (tests).
+    rescales: u32,
 }
 
 impl SyntheticDecoder {
@@ -373,20 +458,25 @@ impl SyntheticDecoder {
     ) -> Result<Self, String> {
         let mut d = Self::new(width, height, fps, frames);
         let l = Nv12Layout::for_video(width, height);
-        let mut surfaces = Vec::with_capacity(pool);
-        for _ in 0..pool {
-            let fd = nitro_shm::create_sealed("nitro-video-synth", l.frame_len() as u64)
-                .map_err(|e| format!("memfd: {e}"))?;
-            surfaces.push(fd);
-        }
         "synthetic-hw".clone_into(&mut d.info.codec);
         d.hw = Some(SynthHw {
             modifier,
-            surfaces,
+            surfaces: synth_pool(l, pool)?,
             held: vec![false; pool],
             cursor: 0,
+            size: (l.width, l.height),
+            pool_gen: 0,
+            native_pool: pool,
+            rescales: 0,
         });
         Ok(d)
+    }
+
+    /// The emulated hardware's pool size and effective `set_scale`
+    /// calls (tests).
+    #[must_use]
+    pub fn scale_state(&self) -> Option<((u32, u32), u32)> {
+        self.hw.as_ref().map(|h| (h.size, h.rescales))
     }
 
     /// Surfaces currently held by the player (tests).
@@ -441,10 +531,10 @@ impl Decoder for SyntheticDecoder {
     }
 
     fn next_dmabuf(&mut self) -> Result<Option<DmabufFrame>, String> {
-        let l = Nv12Layout::for_video(self.info.width, self.info.height);
-        if self.hw.is_none() {
+        let Some(size) = self.hw.as_ref().map(|h| h.size) else {
             return Err("this decoder has no dma-bufs".to_owned());
-        }
+        };
+        let l = Nv12Layout::for_video(size.0, size.1);
         if self.next >= self.frames {
             return Ok(None);
         }
@@ -473,6 +563,8 @@ impl Decoder for SyntheticDecoder {
         drop(map);
         let dup = |fd: &std::os::fd::OwnedFd| rustix::io::dup(fd).map_err(|e| format!("dup: {e}"));
         let desc = DmabufDesc {
+            width: l.width,
+            height: l.height,
             modifier: hw.modifier,
             planes: vec![
                 DmabufPlane {
@@ -489,20 +581,53 @@ impl Decoder for SyntheticDecoder {
         };
         Ok(Some(DmabufFrame {
             pts_us,
-            key: key as u32,
+            key: (hw.pool_gen << 24) | key as u32,
             desc,
         }))
     }
 
     fn release(&mut self, key: u32) {
+        // A key of an older pool: that pool is gone with its surfaces.
         if let Some(h) = self
             .hw
             .as_mut()
-            .and_then(|hw| hw.held.get_mut(key as usize))
+            .filter(|hw| key >> 24 == hw.pool_gen)
+            .and_then(|hw| hw.held.get_mut((key & 0xff_ffff) as usize))
         {
             *h = false;
         }
     }
+
+    fn set_scale(&mut self, size: Option<(u32, u32)>) -> Result<(), String> {
+        let native = Nv12Layout::for_video(self.info.width, self.info.height);
+        let Some(hw) = self.hw.as_mut() else {
+            return Err("software decode cannot scale".to_owned());
+        };
+        let (l, pool) = match size {
+            Some((w, h)) => (Nv12Layout::for_video(w, h), SCALE_POOL),
+            None => (native, hw.native_pool),
+        };
+        if (l.width, l.height) == hw.size {
+            return Ok(());
+        }
+        hw.surfaces = synth_pool(l, pool)?;
+        hw.held = vec![false; pool];
+        hw.cursor = 0;
+        hw.size = (l.width, l.height);
+        hw.pool_gen = (hw.pool_gen + 1) & 0xff;
+        hw.rescales += 1;
+        Ok(())
+    }
+}
+
+/// `pool` sealed memfds of one `l` frame each.
+fn synth_pool(l: Nv12Layout, pool: usize) -> Result<Vec<std::os::fd::OwnedFd>, String> {
+    (0..pool)
+        .map(|_| {
+            nitro_shm::create_sealed("nitro-video-synth", l.frame_len() as u64)
+                .map_err(|e| format!("memfd: {e}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -548,6 +673,57 @@ mod tests {
         let c = d.next_dmabuf().unwrap().unwrap();
         assert_eq!(c.key, a.key);
         assert_eq!(c.pts_us, 200_000);
+    }
+
+    #[test]
+    fn scale_targets_fit_the_plane_with_hysteresis() {
+        let src = (1920, 1080);
+        // KBL, 1080p in the default 1600×900 window: 0.83× < 0.94×.
+        assert_eq!(scale_target(src, (1600, 900), 94, None), Some((1600, 900)));
+        // Letterboxed hint: the aspect is kept.
+        assert_eq!(scale_target(src, (1600, 1000), 94, None), Some((1600, 900)));
+        // Fullscreen 2560×1440: the plane upscales.
+        assert_eq!(scale_target(src, (2560, 1440), 94, None), None);
+        // Within the floor: no needless downscale.
+        assert_eq!(scale_target(src, (1820, 1024), 94, None), None);
+        // No planes: size does not matter.
+        assert_eq!(scale_target(src, (800, 450), 0, None), None);
+        // HSW (no plane scaling): any smaller hint scales.
+        assert_eq!(
+            scale_target(src, (1900, 1068), 100, None),
+            Some((1898, 1068))
+        );
+        // A drag: small moves keep the current size, big ones rescale,
+        // and fitting again goes native.
+        let mut cur = scale_target(src, (1600, 900), 94, None);
+        let mut sizes = Vec::new();
+        for w in [1590u32, 1560, 1520, 1500, 1480, 1560, 1620, 1700, 1850] {
+            let h = w * 9 / 16;
+            let next = scale_target(src, (w, h), 94, cur);
+            if next != cur {
+                sizes.push(next);
+            }
+            cur = next;
+        }
+        assert_eq!(
+            sizes,
+            vec![Some((1498, 842)), Some((1700, 956)), None],
+            "one rescale per big step"
+        );
+    }
+
+    #[test]
+    fn the_synthetic_hw_decoder_scales_into_a_new_pool() {
+        let mut d = SyntheticDecoder::with_dmabuf(64, 36, 10, 25, 3, 0).unwrap();
+        let a = d.next_dmabuf().unwrap().unwrap();
+        assert_eq!((a.desc.width, a.desc.height), (64, 36));
+        d.set_scale(Some((32, 18))).unwrap();
+        let b = d.next_dmabuf().unwrap().unwrap();
+        assert_eq!((b.desc.width, b.desc.height), (32, 18));
+        assert_ne!(a.key >> 24, b.key >> 24, "a new generation");
+        d.release(a.key); // the old pool's: ignored
+        d.set_scale(None).unwrap();
+        assert_eq!(d.scale_state(), Some(((64, 36), 2)));
     }
 
     #[test]

@@ -3,13 +3,14 @@
 //! Deliberately without the `cc` and `pkg-config` crates: the build asks
 //! the system's own `pkg-config` for the flags, compiles one C file with
 //! the system `cc`, and archives it with `ar` — three commands, zero
-//! crates. libavformat, libavcodec and libavutil are linked
+//! crates. libavformat, libavcodec, libavutil and libva (VPP scaling,
+//! #3956; already mapped through libavutil's VAAPI hwcontext) are linked
 //! **dynamically**; nothing of `FFmpeg` is vendored or static.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-const LIBS: [&str; 3] = ["libavformat", "libavcodec", "libavutil"];
+const LIBS: [&str; 4] = ["libavformat", "libavcodec", "libavutil", "libva"];
 
 fn run(cmd: &mut Command) -> String {
     let out = cmd
@@ -19,7 +20,7 @@ fn run(cmd: &mut Command) -> String {
         out.status.success(),
         "nitro-video build: {cmd:?} failed:\n{}\n\
          nitro-video links the system FFmpeg: install libavformat-dev, \
-         libavcodec-dev and libavutil-dev (see DEPENDENCIES.md)",
+         libavcodec-dev, libavutil-dev and libva-dev (see DEPENDENCIES.md)",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()

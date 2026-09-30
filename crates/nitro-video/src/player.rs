@@ -58,7 +58,7 @@ use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, NodeId, WindowState, 
 use crate::controls::{self, ICON_PAUSE, ICON_PLAY, Ids};
 use crate::decode::{
     Decoder, DmabufDesc, FrameBuf, HwDec, HwInfo, MAX_DMABUF_BUFFERS, Matrix, Nv12Layout, Output,
-    StreamInfo, choose_output,
+    StreamInfo, choose_output, scale_target,
 };
 use crate::pacing::{self, Clock};
 
@@ -73,6 +73,9 @@ pub const STEP_SECS: f64 = 5.0;
 /// How long [`Player`] waits for the server's `DmabufFeedback` before
 /// deciding without it (download).
 const FEEDBACK_WAIT_MS: u64 = 200;
+/// How long the plane hint must stay put before the decoder rescales
+/// (#3956): a window drag sends a hint per step.
+const SCALE_DEBOUNCE_MS: u64 = 250;
 /// A presented frame this far behind its due time counts as late.
 const LATE_NS: u64 = 20_000_000;
 
@@ -100,6 +103,9 @@ enum Cmd {
     /// Restart from the keyframe before `secs`, drop frames before
     /// `secs`, and tag what follows with `generation`.
     Seek { generation: u32, secs: f64 },
+    /// Scale later dma-buf frames to this size on the video engine, or
+    /// stop (#3956).
+    Scale(Option<(u32, u32)>),
 }
 
 /// News from the decode thread.
@@ -116,6 +122,8 @@ enum Msg {
         generation: u32,
     },
     Error(String),
+    /// VPP scaling was refused or stopped; frames are native (#3956).
+    ScaleFailed(String),
 }
 
 /// Where a ring slot is.
@@ -125,6 +133,9 @@ enum Slot {
     Decoder,
     /// Decoded and waiting for its moment.
     Ready,
+    /// A dma-buf registration of an older (pre-rescale) pool, destroyed;
+    /// the entry is reused by the next new surface.
+    Empty,
     /// Sent to the server.
     Queued {
         serial: u32,
@@ -170,6 +181,12 @@ pub struct Stats {
     pub skipped: u64,
     /// The pts (µs) of the first presented frames, in order (tests).
     pub shown: Vec<i64>,
+    /// VPP scale changes asked of the decoder (#3956).
+    pub rescales: u64,
+    /// `SurfacePlaneHint`s saying the Surface is off the planes because
+    /// of the plane's downscale limit: the server's fallback, made
+    /// visible.
+    pub scale_limited: u64,
 }
 
 /// The whole app state: `S` for the nitro-ui tree.
@@ -193,9 +210,11 @@ pub struct Player {
     awaiting_feedback: bool,
     /// See [`Player::set_software`].
     software: Option<SoftwareFactory>,
-    /// Per buffer (index = "slot"): the frame buffer it is, its server
-    /// id, where it is, and when it was last used (dma-buf eviction).
+    /// Per buffer (index = "slot"): the frame buffer it is, its size,
+    /// its server id, where it is, and when it was last used (dma-buf
+    /// eviction).
     keys: Vec<FrameBuf>,
+    sizes: Vec<(u32, u32)>,
     buffers: Vec<BufferId>,
     slots: Vec<Slot>,
     used: Vec<u64>,
@@ -217,6 +236,17 @@ pub struct Player {
     started: bool,
     /// Re-anchor the clock at the next `Presented` (see `on_surface`).
     calibrate: bool,
+    /// The last `SurfacePlaneHint` for our node: `(width, height,
+    /// min_scale_pct)` (#3956).
+    plane_hint: Option<(u32, u32, u8)>,
+    /// The VPP scale target asked of the decoder; `None` native.
+    scale: Option<(u32, u32)>,
+    /// The debounce of a rescale.
+    scale_timer: Option<TimerId>,
+    /// VPP failed once: no more attempts.
+    scale_broken: bool,
+    /// The dma-buf pool generation (key >> 24) of the newest frame.
+    pool_gen: Option<u32>,
     /// Counters for `--stats`.
     pub stats: Stats,
     /// A fatal error, reported when the loop ends.
@@ -300,7 +330,7 @@ fn decode_loop(
                     return;
                 }
             }
-            Ok(Cmd::Free(_)) => {}
+            Ok(Cmd::Free(_) | Cmd::Scale(_)) => {}
             Err(_) => return,
         }
     };
@@ -341,6 +371,11 @@ fn decode_loop(
                 held = held.saturating_sub(1);
             }
             Some(Cmd::Start { .. }) => {}
+            Some(Cmd::Scale(size)) => {
+                if let Err(e) = dec.set_scale(size) {
+                    send(Msg::ScaleFailed(e));
+                }
+            }
             Some(Cmd::Seek {
                 generation: g,
                 secs,
@@ -353,8 +388,13 @@ fn decode_loop(
             }
             None => {
                 let r = if dma {
-                    dec.next_dmabuf()
-                        .map(|f| f.map(|f| (f.pts_us, FrameBuf::DmaBuf(f.key), Some(f.desc))))
+                    let r = dec
+                        .next_dmabuf()
+                        .map(|f| f.map(|f| (f.pts_us, FrameBuf::DmaBuf(f.key), Some(f.desc))));
+                    if let Some(e) = dec.take_scale_error() {
+                        send(Msg::ScaleFailed(e));
+                    }
+                    r
                 } else {
                     let slot = free[free.len() - 1];
                     dec.next_frame(maps[slot].as_bytes_mut(), layout)
@@ -430,6 +470,7 @@ impl Player {
             awaiting_feedback: false,
             software: None,
             keys: Vec::new(),
+            sizes: Vec::new(),
             buffers: Vec::new(),
             slots: Vec::new(),
             used: Vec::new(),
@@ -449,6 +490,11 @@ impl Player {
             last_down_ns: 0,
             started: false,
             calibrate: false,
+            plane_hint: None,
+            scale: None,
+            scale_timer: None,
+            scale_broken: false,
+            pool_gen: None,
             stats: Stats::default(),
             error: None,
         })
@@ -544,6 +590,15 @@ impl Player {
             s.late,
             s.skipped
         );
+        if let Some((_, _, min)) = self.plane_hint {
+            let scale = self
+                .scale
+                .map_or_else(|| "native".to_owned(), |(w, h)| format!("{w}x{h}"));
+            line = format!(
+                "{line} scale={scale} rescales={} min_scale={min} scale_limited={}",
+                s.rescales, s.scale_limited
+            );
+        }
         if let Some(f) = &self.fallback {
             line = format!("{line} fallback=\"{f}\"");
         }
@@ -656,6 +711,7 @@ impl Player {
                     return;
                 }
                 self.keys.push(FrameBuf::Shm(i));
+                self.sizes.push((l.width, l.height));
                 self.buffers.push(id);
                 self.slots.push(Slot::Decoder);
                 self.used.push(0);
@@ -667,6 +723,7 @@ impl Player {
             fds: theirs,
             software,
         });
+        self.consider_scale(ui);
     }
 
     /// The index of dma-buf surface `key`, registering it (and making
@@ -677,12 +734,33 @@ impl Player {
         key: u32,
         desc: Option<DmabufDesc>,
     ) -> Result<usize, String> {
-        if let Some(i) = self.keys.iter().position(|k| *k == FrameBuf::DmaBuf(key)) {
+        if let Some(i) = self
+            .keys
+            .iter()
+            .zip(&self.slots)
+            .position(|(k, s)| *k == FrameBuf::DmaBuf(key) && *s != Slot::Empty)
+        {
             return Ok(i);
         }
         let desc = desc.ok_or("a new VA surface without its export")?;
-        let slot = if self.keys.len() < MAX_DMABUF_BUFFERS {
+        // A new pool (a rescale, #3956): the old pool's idle
+        // registrations go now, the busy ones as they come back.
+        let pgen = key >> 24;
+        if self.pool_gen.is_some_and(|g| g != pgen) {
+            for i in 0..self.keys.len() {
+                if self.slots[i] == Slot::Decoder && self.stale(i, pgen) {
+                    self.drop_registration(ui, i)?;
+                }
+            }
+        }
+        self.pool_gen = Some(pgen);
+        let slot = if let Some(i) = self.slots.iter().position(|s| *s == Slot::Empty) {
+            self.keys[i] = FrameBuf::DmaBuf(key);
+            self.slots[i] = Slot::Decoder;
+            i
+        } else if self.keys.len() < MAX_DMABUF_BUFFERS {
             self.keys.push(FrameBuf::DmaBuf(key));
+            self.sizes.push((0, 0));
             self.buffers.push(BufferId(0));
             self.slots.push(Slot::Decoder);
             self.used.push(0);
@@ -699,12 +777,12 @@ impl Player {
             self.keys[i] = FrameBuf::DmaBuf(key);
             i
         };
-        let l = self.layout;
+        let (w, h) = (desc.width, desc.height);
         let id = ui.alloc_buffer_id();
         ui.create_dmabuf_buffer(CreateDmabufBuffer {
             id,
-            width: l.width,
-            height: l.height,
+            width: w,
+            height: h,
             format: format::NV12,
             modifier: desc.modifier,
             planes: desc
@@ -723,7 +801,68 @@ impl Player {
         ui.flush()
             .map_err(|e| format!("registering a dma-buf: {e}"))?;
         self.buffers[slot] = id;
+        self.sizes[slot] = (w, h);
         Ok(slot)
+    }
+
+    /// Whether slot `i` is a registration of a dma-buf pool other than
+    /// generation `gen`.
+    fn stale(&self, i: usize, pgen: u32) -> bool {
+        matches!(self.keys[i], FrameBuf::DmaBuf(k) if k >> 24 != pgen)
+    }
+
+    /// Destroy slot `i`'s server buffer and mark it for reuse.
+    fn drop_registration(&mut self, ui: &mut Ui<Self>, i: usize) -> Result<(), String> {
+        ui.destroy_surface_buffer(self.buffers[i])
+            .map_err(|e| format!("destroying a dma-buf: {e}"))?;
+        self.buffers[i] = BufferId(0);
+        self.slots[i] = Slot::Empty;
+        Ok(())
+    }
+
+    // -- VPP scaling to the plane hint (#3956) -----------------------------
+
+    /// Re-evaluate the scale target after a hint (or the output choice),
+    /// and ask the decoder for it once the hint has settled for
+    /// [`SCALE_DEBOUNCE_MS`].
+    fn consider_scale(&mut self, ui: &mut Ui<Self>) {
+        if self.output != Some(Output::DmaBuf) || self.scale_broken {
+            return;
+        }
+        let Some((w, h, min)) = self.plane_hint else {
+            return;
+        };
+        let want = scale_target((self.info.width, self.info.height), (w, h), min, self.scale);
+        if let Some(t) = self.scale_timer.take() {
+            ui.cancel_timer(&t);
+        }
+        if want == self.scale {
+            return;
+        }
+        self.scale_timer = Some(ui.set_timer(
+            SCALE_DEBOUNCE_MS,
+            |p: &mut Self, ui: &mut Ui<Self>| {
+                p.scale_timer = None;
+                p.apply_scale(ui);
+            },
+        ));
+    }
+
+    /// The debounce ran out: ask the decoder for the current target.
+    fn apply_scale(&mut self, ui: &mut Ui<Self>) {
+        let _ = ui;
+        let Some((w, h, min)) = self.plane_hint else {
+            return;
+        };
+        if self.scale_broken {
+            return;
+        }
+        let want = scale_target((self.info.width, self.info.height), (w, h), min, self.scale);
+        if want != self.scale {
+            self.scale = want;
+            self.stats.rescales += 1;
+            let _ = self.tx.send(Cmd::Scale(want));
+        }
     }
 
     fn fail(&mut self, ui: &mut Ui<Self>, e: String) {
@@ -748,6 +887,19 @@ impl Player {
         let _ = self.tx.send(Cmd::Free(self.keys[slot]));
     }
 
+    /// [`Player::free`], and a registration of a pool that was replaced
+    /// (#3956) is destroyed rather than left for the LRU: the server
+    /// buffer and its GEM go now.
+    fn free_and_prune(&mut self, ui: &mut Ui<Self>, slot: usize) {
+        self.free(slot);
+        if let Some(pgen) = self.pool_gen
+            && self.stale(slot, pgen)
+            && let Err(e) = self.drop_registration(ui, slot)
+        {
+            self.fail(ui, e);
+        }
+    }
+
     // -- the decode thread's news ----------------------------------------
 
     fn on_wake(&mut self, ui: &mut Ui<Self>) {
@@ -762,7 +914,12 @@ impl Player {
                     desc,
                 }) => {
                     if generation != self.generation {
-                        if let Some(i) = self.keys.iter().position(|k| *k == buf) {
+                        if let Some(i) = self
+                            .keys
+                            .iter()
+                            .zip(&self.slots)
+                            .position(|(k, s)| *k == buf && *s != Slot::Empty)
+                        {
                             self.slots[i] = Slot::Decoder;
                         }
                         let _ = self.tx.send(Cmd::Free(buf));
@@ -793,6 +950,15 @@ impl Player {
                 Ok(Msg::Error(e)) => {
                     self.fail(ui, e);
                     return;
+                }
+                Ok(Msg::ScaleFailed(e)) => {
+                    // Once, and native from here on: the video keeps
+                    // playing, the server composites or scales it.
+                    if !self.scale_broken {
+                        eprintln!("nitro-video: VPP scaling off: {e}");
+                    }
+                    self.scale_broken = true;
+                    self.scale = None;
                 }
                 Err(_) => break,
             }
@@ -859,12 +1025,12 @@ impl Player {
             return false;
         }
         let serial = ui.next_serial();
-        let l = self.layout;
+        let (w, h) = self.sizes[slot];
         let r = ui.present_surface(PresentSurface {
             id: node,
             buffer: self.buffers[slot],
             serial,
-            src: IRect::new(0, 0, l.width.cast_signed(), l.height.cast_signed()),
+            src: IRect::new(0, 0, w.cast_signed(), h.cast_signed()),
             matrix: wire_matrix(self.info.matrix),
             range: if self.info.full_range {
                 ColorRange::Full
@@ -925,7 +1091,7 @@ impl Player {
         self.ready.retain(|r| !gone.contains(&r.0));
         for s in skipped {
             self.stats.skipped += 1;
-            self.free(s);
+            self.free_and_prune(ui, s);
         }
         if let Some((slot, pts_us)) = chosen
             && self.present(ui, slot, pts_us)
@@ -993,7 +1159,7 @@ impl Player {
                     if !shown {
                         self.stats.dropped += 1;
                     }
-                    self.free(i);
+                    self.free_and_prune(ui, i);
                 }
             }
             SurfaceEvent::Feedback { node } => {
@@ -1002,6 +1168,22 @@ impl Player {
                 }
             }
             SurfaceEvent::Hint { .. } => {}
+            SurfaceEvent::PlaneHint {
+                node,
+                width,
+                height,
+                min_scale_pct,
+                scale_limited,
+            } => {
+                if node != self.node(ui) || node.is_none() {
+                    return;
+                }
+                if scale_limited {
+                    self.stats.scale_limited += 1;
+                }
+                self.plane_hint = Some((width, height, min_scale_pct));
+                self.consider_scale(ui);
+            }
         }
     }
 

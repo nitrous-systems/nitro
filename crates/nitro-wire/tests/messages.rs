@@ -22,16 +22,17 @@ use nitro_wire::msg::{
     SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
     SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
     SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, SurfaceBufferAllocated, SurfaceExported, SurfaceHint, SurfaceRevoked,
-    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone, WindowInfo,
-    WindowList, WindowListEnd, WindowState,
+    StartResize, SurfaceBufferAllocated, SurfaceExported, SurfaceHint, SurfacePlaneHint,
+    SurfaceRevoked, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome,
+    WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
     CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
     NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
     WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust, dmabuf_flags,
-    drag_actions, format, mod_mask, modifier, popup_flags, resize_edges, window_flags,
+    drag_actions, format, mod_mask, modifier, plane_hint_flags, popup_flags, resize_edges,
+    window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -931,6 +932,14 @@ fn server_messages() -> Vec<ServerMsg> {
             ],
         }
         .into(),
+        SurfacePlaneHint {
+            id: NodeId(93),
+            width: 1600,
+            height: 900,
+            min_scale_pct: 94,
+            flags: plane_hint_flags::SCALE_LIMITED,
+        }
+        .into(),
         DmabufFeedback {
             id: NodeId(92),
             main_device: 0,
@@ -1759,6 +1768,23 @@ fn the_m5_payload_layouts_are_frozen() {
     .encode(&mut w)
     .unwrap();
     assert_eq!(&w.bytes()[..8], &[40, 0, 0, 0, 0x0b, 0x83, 0, 0]);
+    // #3956: `SurfacePlaneHint` is a fixed 14-byte head.
+    let mut w = Writer::new();
+    ServerMsg::from(SurfacePlaneHint {
+        id: NodeId(1),
+        width: 2,
+        height: 3,
+        min_scale_pct: 94,
+        flags: 1,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            14, 0, 0, 0, 0x0c, 0x83, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 94, 1
+        ]
+    );
 
     let mut w = Writer::new();
     ClientMsg::from(RepositionPopup {
@@ -2368,6 +2394,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (SurfaceBufferAllocated::OP, 0x8300),
         (AllocSurfaceBuffersFailed::OP, 0x8300),
         (DmabufFeedback::OP, 0x8300),
+        (SurfacePlaneHint::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2407,6 +2434,7 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(CreateDmabufBuffer::OP, 0x0313);
     assert_eq!(PresentSurfaceFenced::OP, 0x0314);
     assert_eq!(DmabufFeedback::OP, 0x830b);
+    assert_eq!(SurfacePlaneHint::OP, 0x830c);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.

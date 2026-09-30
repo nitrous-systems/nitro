@@ -1065,6 +1065,9 @@ struct Server {
     /// Frames latched early onto a plane, their fence still pending
     /// (#3938), cumulative.
     plane_fence_latches: u64,
+    /// Surfaces that fell off the planes because of the scaling rule
+    /// (#3956), cumulative: one per node per entry into that state.
+    plane_reject_scale: u64,
     /// Fences handed to the display as `IN_FENCE_FD`, cumulative.
     plane_fences: u64,
     /// CPU-readable dma-bufs latched early (#3938): their read bracket
@@ -1524,6 +1527,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         plane_flips: 0,
         fence_waits: 0,
         plane_fence_latches: 0,
+        plane_reject_scale: 0,
         plane_fences: 0,
         unbracketed: HashSet::new(),
         implicit_fence_fallbacks: 0,
@@ -2173,6 +2177,7 @@ impl Server {
                 existing.alpha = false;
                 existing.plane_info = self.backend.planes(info.id);
                 existing.hint_format = planes::hint_format(&existing.plane_info);
+                existing.min_scale_pct = planes::min_scale_pct(&existing.plane_info);
                 existing.invalidate();
                 continue;
             }
@@ -2197,6 +2202,7 @@ impl Server {
             );
             state.plane_info = self.backend.planes(info.id);
             state.hint_format = planes::hint_format(&state.plane_info);
+            state.min_scale_pct = planes::min_scale_pct(&state.plane_info);
             // The overview atlas is paid here, when the output appears,
             // and pre-faulted: nothing on the Super path allocates.
             if self.wants_atlas() {
@@ -7760,7 +7766,8 @@ impl Server {
                 | nitro_wire::types::caps::RELEASE
                 | nitro_wire::types::caps::SURFACE
                 | nitro_wire::types::caps::DMABUF
-                | nitro_wire::types::caps::SHARE;
+                | nitro_wire::types::caps::SHARE
+                | nitro_wire::types::caps::PLANE_HINT;
             if self
                 .outputs
                 .iter()
@@ -8725,8 +8732,9 @@ impl Server {
         let surfaces_set = outcome.surfaces_set;
         if client.client_caps & nitro_wire::types::caps::SURFACE != 0 {
             let dma = client.client_caps & nitro_wire::types::caps::DMABUF != 0;
+            let plane = client.client_caps & nitro_wire::types::caps::PLANE_HINT != 0;
             for (id, key) in outcome.new_surfaces {
-                self.surface_hints.track(key, token, id);
+                self.surface_hints.track(key, token, id, plane);
                 if dma {
                     self.feedback.track(key, token, id);
                 }
@@ -10347,6 +10355,7 @@ impl Server {
         let uid = client.peer_uid;
         let surface_caps = client.client_caps & nitro_wire::types::caps::SURFACE != 0;
         let dma_caps = client.client_caps & nitro_wire::types::caps::DMABUF != 0;
+        let plane_caps = client.client_caps & nitro_wire::types::caps::PLANE_HINT != 0;
         let imported = match self.shares.import(share, token, uid, id) {
             Ok(i) => i,
             Err(share::ImportError::OwnToken) => {
@@ -10370,7 +10379,7 @@ impl Server {
         if let Some(node) = imported.node {
             debug!("client token {token}: imported a surface as {}", id.raw());
             if surface_caps {
-                self.surface_hints.track(node, token, id);
+                self.surface_hints.track(node, token, id, plane_caps);
                 if dma_caps {
                     self.feedback.track(node, token, id);
                 }
@@ -10628,6 +10637,46 @@ impl Server {
                 }));
             }
         }
+        self.send_plane_hints();
+    }
+
+    /// Send the `SurfacePlaneHint`s (#3956) that changed. Only plane
+    /// hints: [`Self::plan_planes`] calls it when a scale-limited set
+    /// changed, and it must not re-send anything else per paint.
+    fn send_plane_hints(&mut self) {
+        let outputs = &self.outputs;
+        let hints = self
+            .surface_hints
+            .plane_changed(&self.scene, |scene, node| {
+                let output = scene
+                    .node(node)
+                    .ok()
+                    .and_then(|n| scene.window_info(n.window()).ok())
+                    .and_then(nitro_scene::Window::output);
+                let min = outputs
+                    .iter()
+                    .find(|o| Some(o.scene_id) == output)
+                    .or_else(|| outputs.first())
+                    .map_or(0, |o| o.min_scale_pct);
+                let limited = outputs.iter().any(|o| o.scale_limited.contains(&node));
+                let flags = if limited {
+                    nitro_wire::types::plane_hint_flags::SCALE_LIMITED
+                } else {
+                    0
+                };
+                (min, flags)
+            });
+        for (token, id, width, height, min_scale_pct, flags) in hints {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::SurfacePlaneHint(msg::SurfacePlaneHint {
+                    id,
+                    width,
+                    height,
+                    min_scale_pct,
+                    flags,
+                }));
+            }
+        }
     }
 
     /// Refuse a popup op from a client that never listed `POPUP` in its
@@ -10862,11 +10911,82 @@ impl Server {
             .planner
             .decide(&inp, now, &mut |a| backend.test_layout(id, a).ok());
         let want = !gpu_nodes.is_empty() || self.gpu.owner == Some(id);
+        let limited_changed = self.note_scale_limited(index, &sc.cands, &d);
         self.plan = sc;
         if want {
             self.gpu_want(index, &d);
         }
         self.apply_decision(index, d);
+        if limited_changed {
+            self.send_plane_hints();
+        }
+    }
+
+    /// The "no silent fallback" of #3956: which of `cands` are off the
+    /// planes only because of the scaling rule. Logs each node once as it
+    /// enters or leaves that state, counts `plane_reject_scale`, and
+    /// returns whether output `index`'s set changed.
+    fn note_scale_limited(
+        &mut self,
+        index: usize,
+        cands: &[planes::Candidate],
+        d: &planes::Decision,
+    ) -> bool {
+        let o = &self.outputs[index];
+        let mut now: Vec<nitro_scene::NodeKey> = Vec::new();
+        for c in cands {
+            if d.places(c.node) || !planes::scale_limited(c, &o.plane_info) {
+                continue;
+            }
+            now.push(c.node);
+            if o.scale_limited.contains(&c.node) {
+                continue;
+            }
+            let (sw, sh) = (c.src.w >> 16, c.src.h >> 16);
+            let pct = if sw == 0 {
+                0
+            } else {
+                u64::from(c.dst.w.max(0).cast_unsigned()) * 100 / u64::from(sw)
+            };
+            let path = if d.gpu.contains(&c.node) {
+                "GPU helper"
+            } else if self
+                .scene
+                .node(c.node)
+                .ok()
+                .and_then(nitro_scene::Node::surface)
+                .and_then(|s| s.content)
+                .and_then(|ct| self.scene.buffer(ct.buffer).ok())
+                .is_some_and(|b| b.cpu_readable())
+            {
+                "CPU scaled blend"
+            } else {
+                "placeholder"
+            };
+            info!(
+                "{}: Surface {:?} off planes: {sw}x{sh} -> {}x{} is {pct}% (planes take >= {}%); shown by {path}",
+                o.kms_id, c.node, c.dst.w, c.dst.h, o.min_scale_pct
+            );
+            self.plane_reject_scale += 1;
+        }
+        let o = &mut self.outputs[index];
+        if now == o.scale_limited {
+            return false;
+        }
+        for n in &o.scale_limited {
+            if !now.contains(n) {
+                let why = if d.places(*n) {
+                    "back on a plane"
+                } else if cands.iter().any(|c| c.node == *n) {
+                    "no longer scale-limited"
+                } else {
+                    "gone"
+                };
+                info!("{}: Surface {n:?} scale limit cleared: {why}", o.kms_id);
+            }
+        }
+        o.scale_limited = now;
+        true
     }
 
     /// Make `d` output `index`'s layout: flag the placed Surfaces as holes,
@@ -11074,6 +11194,14 @@ impl Server {
         pairs.push(("plane_fences", self.plane_fences));
         pairs.push(("plane_fence_latches", self.plane_fence_latches));
         pairs.push(("plane_releases_held", self.held_releases.len() as u64));
+        pairs.push(("plane_reject_scale", self.plane_reject_scale));
+        pairs.push((
+            "planes_scale_limited",
+            self.outputs
+                .iter()
+                .map(|o| o.scale_limited.len() as u64)
+                .sum(),
+        ));
     }
 }
 

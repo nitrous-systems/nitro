@@ -503,3 +503,129 @@ fn an_unobscured_window_goes_on_the_overlay_above_the_ui() {
     assert_eq!(h.stat("planes_in_use"), 1);
     h.quit();
 }
+
+/// #3956: a buffer bigger than the plane can downscale is reported, not
+/// dropped silently — a log line, `plane_reject_scale`, the
+/// `planes_scale_limited` gauge and a `SurfacePlaneHint` with the flag —
+/// and a buffer at the hinted size goes on the plane and clears it.
+#[test]
+fn a_scale_limited_surface_is_reported_and_a_hinted_size_goes_on_a_plane() {
+    use nitro_wire::types::plane_hint_flags;
+    let h = Harness::start("scale-limit", kbl());
+    let mut conn = Connection::connect(&h.wire_path, "scale").expect("wire connect");
+    assert!(conn.has_caps(caps::PLANE_HINT));
+    conn.client_caps(caps::SURFACE | caps::RELEASE | caps::PLANE_HINT)
+        .unwrap();
+    let mut seen = Vec::new();
+    conn.tx()
+        .create_window(ROOT, "scale", Size::new(160.0, 120.0), Layer::Normal)
+        .create_surface(SURF, ROOT, Rect::new(0.0, 0.0, 160.0, 120.0))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 1);
+    let hint = expect(&mut conn, &mut seen, "SurfacePlaneHint", |m| match m {
+        ServerMsg::SurfacePlaneHint(p) => Some(*p),
+        _ => None,
+    });
+    assert_eq!(
+        (
+            hint.id,
+            hint.width,
+            hint.height,
+            hint.min_scale_pct,
+            hint.flags
+        ),
+        (SURF, 160, 120, 94, 0)
+    );
+    seen.clear();
+    // 200×150 into 160×120: 0.8×, under the rule.
+    let alloc = |conn: &mut Connection, seen: &mut Vec<ServerMsg>, first: u32, w, hh| {
+        conn.alloc_surface_buffers(AllocSurfaceBuffers {
+            node: SURF,
+            first_id: BufferId(first),
+            count: 2,
+            format: format::NV12,
+            width: w,
+            height: hh,
+        })
+        .unwrap();
+        conn.flush().unwrap();
+        expect(conn, seen, "SurfaceBufferAllocated", |m| {
+            matches!(m, ServerMsg::SurfaceBufferAllocated(a) if a.id == BufferId(first + 1))
+                .then_some(())
+        });
+    };
+    alloc(&mut conn, &mut seen, 10, 200, 150);
+    let mut serial = 2;
+    let mut show =
+        |conn: &mut Connection, seen: &mut Vec<ServerMsg>, first: u32, w: i32, hh: i32| {
+            conn.present_surface(PresentSurface {
+                id: SURF,
+                buffer: BufferId(first + serial % 2),
+                serial,
+                src: IRect::new(0, 0, w, hh),
+                matrix: ColorMatrix::Bt709,
+                range: ColorRange::Limited,
+                damage: vec![],
+            })
+            .unwrap();
+            conn.flush().unwrap();
+            presented(conn, seen, serial);
+            serial += 1;
+        };
+    for _ in 0..30 {
+        show(&mut conn, &mut seen, 10, 200, 150);
+    }
+    assert_eq!(h.stat("planes_mode"), 0);
+    assert_eq!(h.stat("plane_reject_scale"), 1, "once, not per frame");
+    assert_eq!(h.stat("planes_scale_limited"), 1);
+    let limited = expect(&mut conn, &mut seen, "flagged hint", |m| match m {
+        ServerMsg::SurfacePlaneHint(p) if p.flags & plane_hint_flags::SCALE_LIMITED != 0 => {
+            Some(*p)
+        }
+        _ => None,
+    });
+    assert_eq!((limited.width, limited.height), (160, 120));
+    seen.clear();
+
+    // At the hinted size: on a plane, flag and gauge cleared.
+    alloc(&mut conn, &mut seen, 20, 160, 120);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while h.stat("planes_mode") != 1 {
+        assert!(Instant::now() < deadline, "no plane");
+        show(&mut conn, &mut seen, 20, 160, 120);
+    }
+    assert_eq!(h.stat("planes_scale_limited"), 0);
+    assert_eq!(h.stat("plane_reject_scale"), 1);
+    expect(&mut conn, &mut seen, "cleared hint", |m| match m {
+        ServerMsg::SurfacePlaneHint(p) if p.flags == 0 => Some(()),
+        _ => None,
+    });
+    h.quit();
+}
+
+/// A client that did not list `PLANE_HINT` never gets the op.
+#[test]
+fn no_plane_hint_without_the_bit() {
+    let h = Harness::start("no-plane-hint", kbl());
+    let mut conn = Connection::connect(&h.wire_path, "nohint").expect("wire connect");
+    conn.client_caps(caps::SURFACE | caps::RELEASE).unwrap();
+    let mut seen = Vec::new();
+    conn.tx()
+        .create_window(ROOT, "nohint", Size::new(160.0, 120.0), Layer::Normal)
+        .create_surface(SURF, ROOT, Rect::new(0.0, 0.0, 160.0, 120.0))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 1);
+    expect(&mut conn, &mut seen, "SurfaceHint", |m| {
+        matches!(m, ServerMsg::SurfaceHint(_)).then_some(())
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::SurfacePlaneHint(_)))
+    );
+    h.quit();
+}

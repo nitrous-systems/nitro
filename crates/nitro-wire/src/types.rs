@@ -482,6 +482,11 @@ pub mod caps {
     /// [`SurfaceRevoked`](crate::msg::SurfaceRevoked). Local links only;
     /// must be listed in `ClientCaps`.
     pub const SHARE: u32 = 1 << 17;
+    /// [`SurfacePlaneHint`](crate::msg::SurfacePlaneHint) (#3956): the
+    /// server tells a `Surface`'s producer how far a display plane can
+    /// downscale and whether the node fell off the planes for it. Local
+    /// links only; must be listed in `ClientCaps`.
+    pub const PLANE_HINT: u32 = 1 << 18;
     /// Every bit from M5-A onwards: the range
     /// [`ClientCaps`](crate::msg::ClientCaps) governs.
     ///
@@ -490,8 +495,17 @@ pub mod caps {
     /// knows the op, because the bits and the op arrived in the same
     /// change. A future milestone extends this constant rather than
     /// teaching every caller a new number.
-    pub const CAPS_M5_MASK: u32 =
-        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION | SURFACE | SHARE;
+    pub const CAPS_M5_MASK: u32 = POPUP
+        | CURSOR
+        | DRAG
+        | OUTPUTS
+        | KEYMAP
+        | RELEASE
+        | DATA
+        | OPAQUE_REGION
+        | SURFACE
+        | SHARE
+        | PLANE_HINT;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -915,6 +929,13 @@ pub mod dmabuf_flags {
     pub const IMPORT: u32 = 1 << 2;
 }
 
+/// Bits of [`SurfacePlaneHint::flags`](crate::msg::SurfacePlaneHint) (#3956).
+pub mod plane_hint_flags {
+    /// The node's current buffer is off the display planes because its
+    /// size needs more downscaling than a plane does (informational).
+    pub const SCALE_LIMITED: u8 = 1 << 0;
+}
+
 /// One format + modifier pair of a
 /// [`DmabufFeedback`](crate::msg::DmabufFeedback) (#3918).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1017,7 +1038,8 @@ mod tests {
         assert_eq!(caps::OPAQUE_REGION, 1 << 15);
         assert_eq!(caps::SURFACE, 1 << 16);
         assert_eq!(caps::SHARE, 1 << 17);
-        assert_eq!(caps::CAPS_M5_MASK, 0x3ff00);
+        assert_eq!(caps::PLANE_HINT, 1 << 18);
+        assert_eq!(caps::CAPS_M5_MASK, 0x7ff00);
         // Every M5 bit is in the mask, and nothing else is.
         for bit in [
             caps::POPUP,
@@ -1030,6 +1052,7 @@ mod tests {
             caps::OPAQUE_REGION,
             caps::SURFACE,
             caps::SHARE,
+            caps::PLANE_HINT,
         ] {
             assert_eq!(caps::CAPS_M5_MASK & bit, bit);
         }

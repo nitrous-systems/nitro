@@ -59,6 +59,23 @@ pub enum SurfaceEvent {
         /// The surface node, or `NONE` for the default feedback.
         node: NodeId,
     },
+    /// How the node's buffers fit the display planes (#3956; only after
+    /// [`Ui::enable_dmabuf`](crate::Ui::enable_dmabuf)): render at
+    /// `width`×`height` when the source is bigger than a plane can
+    /// downscale to it.
+    PlaneHint {
+        /// The surface node.
+        node: NodeId,
+        /// Its width, device pixels.
+        width: u32,
+        /// Its height, device pixels.
+        height: u32,
+        /// Smallest dst/src ratio a plane takes, percent (0: no planes).
+        min_scale_pct: u8,
+        /// The current buffer is off the planes because of that limit
+        /// (informational; do not decide on it).
+        scale_limited: bool,
+    },
 }
 
 /// Where an overlay child sits over the surface.

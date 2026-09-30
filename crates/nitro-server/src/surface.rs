@@ -301,10 +301,18 @@ struct HintState {
     token: u64,
     id: NodeId,
     sent: Option<(u32, u32, u32)>,
+    /// The connection listed `PLANE_HINT` (#3956).
+    plane: bool,
+    /// The `SurfacePlaneHint` last sent: `(width, height, min_pct, flags)`.
+    sent_plane: Option<(u32, u32, u8, u8)>,
 }
 
 /// A hint to send: `(token, node id, fourcc, width, height)`.
 pub type Hint = (u64, NodeId, u32, u32, u32);
+
+/// A plane hint to send (#3956): `(token, node id, width, height,
+/// min_scale_pct, flags)`.
+pub type PlaneHint = (u64, NodeId, u32, u32, u8, u8);
 
 /// Tracks the Surface nodes of clients that listed `SURFACE` and what
 /// `SurfaceHint` each was last sent. Keyed by node *and* connection: a
@@ -317,12 +325,14 @@ pub struct Hints {
 
 impl Hints {
     /// Start tracking a Surface node for connection `token`, which names
-    /// it `id`.
-    pub fn track(&mut self, node: NodeKey, token: u64, id: NodeId) {
+    /// it `id`; `plane`: the connection also listed `PLANE_HINT`.
+    pub fn track(&mut self, node: NodeKey, token: u64, id: NodeId, plane: bool) {
         self.nodes.entry((node, token)).or_insert(HintState {
             token,
             id,
             sent: None,
+            plane,
+            sent_plane: None,
         });
     }
 
@@ -365,6 +375,42 @@ impl Hints {
             }
             true
         });
+        out
+    }
+
+    /// The `SurfacePlaneHint`s (#3956) that changed, for the nodes whose
+    /// connection listed `PLANE_HINT`: `plane(scene, node)` is the node's
+    /// `(min_scale_pct, flags)`. Like [`changed`](Self::changed), an empty
+    /// device rect sends nothing; dead nodes are left to `changed`.
+    pub fn plane_changed(
+        &mut self,
+        scene: &Scene,
+        plane: impl Fn(&Scene, NodeKey) -> (u8, u8),
+    ) -> Vec<PlaneHint> {
+        let mut out = Vec::new();
+        for ((key, _), h) in &mut self.nodes {
+            if !h.plane {
+                continue;
+            }
+            let Ok(node) = scene.node(*key) else {
+                continue;
+            };
+            let device = device_rect(node);
+            if node.kind() != NodeKind::Surface || device.is_empty() {
+                continue;
+            }
+            let (min, flags) = plane(scene, *key);
+            let now = (
+                device.w.cast_unsigned(),
+                device.h.cast_unsigned(),
+                min,
+                flags,
+            );
+            if h.sent_plane != Some(now) {
+                h.sent_plane = Some(now);
+                out.push((h.token, h.id, now.0, now.1, now.2, now.3));
+            }
+        }
         out
     }
 }
@@ -627,7 +673,7 @@ mod tests {
     fn hints_fire_on_first_size_and_on_change() {
         let (mut s, n, _) = world();
         let mut h = Hints::default();
-        h.track(n, 7, NodeId(5));
+        h.track(n, 7, NodeId(5), true);
         let mut d = Damage::new();
         s.update(&mut nitro_scene::DamageSink::new(&mut [(
             nitro_scene::OutputId(0),
@@ -635,6 +681,15 @@ mod tests {
         )]));
         assert_eq!(h.changed(&s, |_, _| 1), vec![(7, NodeId(5), 1, 16, 16)]);
         assert!(h.changed(&s, |_, _| 1).is_empty());
+        assert_eq!(
+            h.plane_changed(&s, |_, _| (94, 0)),
+            vec![(7, NodeId(5), 16, 16, 94, 0)]
+        );
+        assert!(h.plane_changed(&s, |_, _| (94, 0)).is_empty());
+        assert_eq!(
+            h.plane_changed(&s, |_, _| (94, 1)),
+            vec![(7, NodeId(5), 16, 16, 94, 1)]
+        );
         s.set_bounds(C, n, Rect::new(0.0, 0.0, 32.0, 8.0)).unwrap();
         s.update(&mut nitro_scene::DamageSink::new(&mut [(
             nitro_scene::OutputId(0),

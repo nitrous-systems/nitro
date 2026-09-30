@@ -366,3 +366,32 @@ fn vaapi_decodes_the_clip_like_software_when_present() {
     }
     assert_eq!(pts, sw_pts);
 }
+
+/// #3956: a hardware decoder whose frames are bigger than the Surface
+/// (the harness's planes do not scale: `min_scale_pct` 100) is asked to
+/// scale to the hinted size, once, after the debounce; frames are then
+/// registered and presented at that size, and the old pool's
+/// registrations go.
+#[test]
+fn a_big_hw_stream_is_scaled_to_the_plane_hint() {
+    let dec = SyntheticDecoder::with_dmabuf(640, 360, 30, 3000, 6, modifier::LINEAR)
+        .expect("synthetic hw");
+    let mut b = harness_on(dec, Opts::default());
+    let h = &mut b.h;
+    assert_eq!(wait_output(h), Output::DmaBuf);
+    h.wait_for("a rescale", |h| {
+        h.settle();
+        h.state().stats.rescales >= 1 && h.state().summary_line().contains("scale=2")
+    });
+    let n = h.state().stats.presented;
+    wait_presented(h, n + 20);
+    let p = h.state();
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(p.stats.rescales, 1, "{}", p.summary_line());
+    let line = p.summary_line();
+    assert!(line.contains("min_scale=100"), "{line}");
+    assert!(!line.contains("scale=native"), "{line}");
+    // Old-pool registrations are pruned: at most the new pool plus what
+    // was in flight.
+    assert!(p.buffer_count() <= 12, "{}", p.buffer_count());
+}

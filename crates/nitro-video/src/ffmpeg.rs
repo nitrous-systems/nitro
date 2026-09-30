@@ -74,6 +74,15 @@ unsafe extern "C" {
         errlen: c_int,
     ) -> c_int;
     fn nv_release(c: *mut NvCtx, key: u32) -> c_int;
+    fn nv_set_scale(
+        c: *mut NvCtx,
+        w: c_int,
+        h: c_int,
+        pool: c_int,
+        err: *mut c_char,
+        errlen: c_int,
+    ) -> c_int;
+    fn nv_take_scale_error(c: *mut NvCtx, err: *mut c_char, errlen: c_int) -> c_int;
     fn nv_info(
         c: *const NvCtx,
         width: *mut c_int,
@@ -127,6 +136,8 @@ pub struct LibavDecoder {
     ctx: NonNull<NvCtx>,
     info: StreamInfo,
     hw: Option<HwInfo>,
+    /// The VPP scale target (#3956), `None` native.
+    scale: Option<(u32, u32)>,
 }
 
 /// The default VA-API device.
@@ -279,6 +290,7 @@ impl LibavDecoder {
         Ok(Self {
             ctx,
             hw,
+            scale: None,
             info: StreamInfo {
                 width,
                 height,
@@ -394,12 +406,16 @@ impl Decoder for LibavDecoder {
                 stride: pitches[i],
             })
             .collect();
-        if (w, h)
-            != (
-                self.info.width.cast_signed(),
-                self.info.height.cast_signed(),
-            )
-        {
+        let native = (
+            self.info.width.cast_signed(),
+            self.info.height.cast_signed(),
+        );
+        // A VPP-scaled frame (#3956) is the scale target's size; a frame
+        // after VPP gave up mid-stream is native again.
+        let scaled = self
+            .scale
+            .map(|(sw, sh)| (sw.cast_signed(), sh.cast_signed()));
+        if (w, h) != native && Some((w, h)) != scaled {
             self.release(key);
             return Err(format!(
                 "the stream changed size ({}x{} → {w}x{h})",
@@ -409,13 +425,55 @@ impl Decoder for LibavDecoder {
         Ok(Some(DmabufFrame {
             pts_us: pts,
             key,
-            desc: DmabufDesc { modifier, planes },
+            desc: DmabufDesc {
+                width: w.cast_unsigned(),
+                height: h.cast_unsigned(),
+                modifier,
+                planes,
+            },
         }))
     }
 
     fn release(&mut self, key: u32) {
         // SAFETY: `ctx` is live and exclusively ours.
         let _ = unsafe { nv_release(self.ctx.as_ptr(), key) };
+    }
+
+    fn set_scale(&mut self, size: Option<(u32, u32)>) -> Result<(), String> {
+        if self.hw.is_none() {
+            return Err("software decode cannot scale".to_owned());
+        }
+        let (w, h) = size.map_or((0, 0), |(w, h)| (w & !1, h & !1));
+        let mut err = ErrBuf::new();
+        let pool = c_int::try_from(crate::decode::SCALE_POOL).unwrap_or(5);
+        // SAFETY: `ctx` is live and exclusively ours; `err` is a local
+        // buffer of the length passed.
+        let r = unsafe {
+            nv_set_scale(
+                self.ctx.as_ptr(),
+                c_int::try_from(w).unwrap_or(0),
+                c_int::try_from(h).unwrap_or(0),
+                pool,
+                err.ptr(),
+                err.len(),
+            )
+        };
+        if r < 0 {
+            self.scale = None;
+            return Err(err.message("VPP scaling failed"));
+        }
+        self.scale = size.map(|_| (w, h));
+        Ok(())
+    }
+
+    fn take_scale_error(&mut self) -> Option<String> {
+        let mut err = ErrBuf::new();
+        // SAFETY: as in `set_scale`.
+        let r = unsafe { nv_take_scale_error(self.ctx.as_ptr(), err.ptr(), err.len()) };
+        (r == 1).then(|| {
+            self.scale = None;
+            err.message("VPP scaling failed")
+        })
     }
 }
 

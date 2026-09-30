@@ -538,6 +538,11 @@ pub struct OutputState {
     /// A `Composite` for this output is out (serial): nothing more is
     /// painted until its buffer is committed.
     pub gpu_pending: Option<u64>,
+    /// Surfaces that are off this output's planes only because of the
+    /// scaling rule (#3956), as of the last decision.
+    pub scale_limited: Vec<nitro_scene::NodeKey>,
+    /// [`crate::planes::min_scale_pct`] of this output's planes.
+    pub min_scale_pct: u8,
     /// What the helper's last frame showed, `(node, buffer, dst)`: a
     /// layer that changed or moved is damage for the next.
     pub gpu_last: Vec<(nitro_scene::NodeKey, nitro_scene::BufferKey, IRect)>,
@@ -598,6 +603,8 @@ impl OutputState {
             hint_format: nitro_wire::types::format::NV12,
             gpu_layers: Vec::new(),
             gpu_pending: None,
+            scale_limited: Vec::new(),
+            min_scale_pct: 0,
             gpu_last: Vec::new(),
             plane_info: Vec::new(),
             plane_fences: Vec::new(),
