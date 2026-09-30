@@ -379,6 +379,26 @@ fn an_overlapped_surface_is_composited_by_the_helper_the_top_one_on_the_overlay(
 }
 
 #[test]
+fn steady_mode_2_raster_means_read_zero_not_stale_startup_samples() {
+    // Only raster frames used to push paint samples, so the 120-frame
+    // windows kept the startup full raster forever in steady video.
+    let h = Harness::start("means", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    s.play("mode 2", || h.stat("planes_mode") == 2);
+    let frames = h.stat("gpu_frames");
+    for _ in 0..130 {
+        s.step();
+    }
+    wait_for("composites", || h.stat("gpu_frames") >= frames + 125);
+    assert!(h.stat("damage_px_mean") > 0);
+    assert_eq!(h.stat("raster_px_mean"), 0);
+    assert_eq!(h.stat("paint_us_mean"), 0);
+    assert_eq!(h.stat("copy_us_mean"), 0);
+    h.quit();
+}
+
+#[test]
 fn a_buffer_the_helper_samples_is_released_after_its_fence() {
     let h = Harness::start("release", GpuHelper::On, true);
     wait_for("the helper", || h.stat("gpu_state") == 2);

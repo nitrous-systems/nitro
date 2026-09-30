@@ -1745,11 +1745,18 @@ byte-identical, other binaries byte-identical.
   switch away (`chvt 1`) stopped it (`gpu_state 0`, `planes_mode 0`), and
   switching back respawned it and returned to mode 2.
 - **Not measured on testhost2** (Kaby Lake/anv, the human's GDM session).
-- **Open:** in mode 2 the server still rasterized ~0.6 Mpx per frame
-  (`raster_px_mean` 631 702, `paint_us_mean` ~1.2 ms) with only video
-  changing. That looks like shadow damage the composited Surface should
-  not cause. It is not investigated yet; it is the likely source of the
-  extra server CPU (66 vs 44 ticks).
+- **Steady mode 2 rasterizes nothing** (#3945). The #3922 reading of
+  `raster_px_mean` 631 702 and `paint_us_mean` ~1.2 ms came from stale
+  samples: `paint_gpu` pushed paint samples only on frames that
+  rasterized, so the 120-frame windows still held startup and
+  invalidation frames. Re-measured on the same scene: `samples paint`
+  took 1 sample in 10 s, against ~600 helper frames. `damage_px_mean`
+  921 600 is the composited Surface's 1280×720 rect, which is the
+  correct helper damage. Since #3945 a composite that rasterizes nothing
+  counts as a 0 sample. Server CPU re-measured at 50 ticks/10 s (vs 44
+  with `off`); perf puts the difference in syscall/epoll/allocation
+  churn, not raster. Follow-up: #3947.
+
 
 ## Client dma-bufs (#3918)
 

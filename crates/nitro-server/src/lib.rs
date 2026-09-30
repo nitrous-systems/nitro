@@ -13187,13 +13187,24 @@ impl Server {
         let o = &mut self.outputs[index];
         o.gpu_last = now;
         o.gpu_submitted(serial);
+        // The means are per-frame work: a composite that rasterized
+        // nothing (steady video under the helper) counts as 0, so the
+        // windows advance in step with `damage_px` instead of holding
+        // stale startup samples. `paint_log` stays raster frames only.
+        // Mode 2 never copies out of the shadow: `copy_us` is 0.
+        self.stats.copy_us.push(0);
         if let Some(p) = painted {
             self.stats.paint_us.push(p.paint_us);
             self.stats.raster_px.push(p.raster_px);
             self.stats.blit_px.push(p.moved_px);
             self.blit_frames += u64::from(p.blitted);
             self.stats.paint_log.push(p.paint_us);
+        } else {
+            self.stats.paint_us.push(0);
+            self.stats.raster_px.push(0);
+            self.stats.blit_px.push(0);
         }
+
         let damage_px = frame::region_area(&damage);
         self.stats.damage_px.push(damage_px);
         self.stats.damage_log.push(damage_px);
