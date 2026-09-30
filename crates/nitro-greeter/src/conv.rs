@@ -69,6 +69,8 @@ pub struct Conversation {
     outstanding: VecDeque<Sent>,
     notices: Vec<(MessageKind, String)>,
     last_error: Option<(ErrorKind, String)>,
+    /// Whether the user answered a question in the current attempt.
+    answered: bool,
 }
 
 impl Default for Conversation {
@@ -88,7 +90,18 @@ impl Conversation {
             outstanding: VecDeque::new(),
             notices: Vec::new(),
             last_error: None,
+            answered: false,
         }
+    }
+
+    /// Whether the user answered at least one question since the last
+    /// [`Conversation::submit_user`]. A failure without one (a locked
+    /// account, an expired one) was not caused by anything typed, so
+    /// retrying it automatically would spin PAM transactions without
+    /// the user doing anything.
+    #[must_use]
+    pub fn answered(&self) -> bool {
+        self.answered
     }
 
     /// The current state.
@@ -145,6 +158,7 @@ impl Conversation {
         self.cancel_open(&mut out);
         name.clone_into(&mut self.username);
         self.notices.clear();
+        self.answered = false;
         self.open = true;
         self.outstanding.push_back(Sent::Live);
         out.push(Request::CreateSession {
@@ -160,6 +174,7 @@ impl Conversation {
             return Vec::new();
         }
         self.last_error = None;
+        self.answered = true;
         self.outstanding.push_back(Sent::Live);
         self.state = State::Waiting;
         vec![Request::PostAuthMessageResponse {
@@ -432,6 +447,21 @@ mod tests {
         assert!(c.answer("x".into()).is_empty());
         assert!(c.on_response(Response::Success).is_empty());
         assert_eq!(c.state(), &State::User);
+    }
+
+    #[test]
+    fn answered_records_whether_the_user_typed_in_this_attempt() {
+        let mut c = Conversation::new();
+        c.submit_user("alice");
+        c.on_response(auth_error("account locked"));
+        assert!(!c.answered(), "failed before any question");
+        c.submit_user("alice");
+        c.on_response(ask(Secret, "Password: "));
+        c.answer("wrong".into());
+        c.on_response(auth_error("Authentication failure"));
+        assert!(c.answered());
+        c.submit_user("alice");
+        assert!(!c.answered(), "reset by a new attempt");
     }
 
     #[test]

@@ -165,6 +165,45 @@ fn a_wrong_password_shows_the_reason_and_asks_again() {
 }
 
 #[test]
+fn a_failure_without_a_question_is_not_retried_by_itself() {
+    // pam_faillock on a locked account: an error line, then auth_error,
+    // and nothing the user typed. Retrying at once would spin.
+    let (mut h, b) = lock_screen();
+    assert_eq!(sent(&b), [create("alice")]);
+    recv(
+        &mut h,
+        Response::AuthMessage {
+            kind: MessageKind::Error,
+            text: "Account locked".into(),
+        },
+    );
+    assert_eq!(
+        sent(&b),
+        [Request::PostAuthMessageResponse { response: None }]
+    );
+    recv(
+        &mut h,
+        Response::Error {
+            kind: ErrorKind::AuthError,
+            description: "Authentication failure".into(),
+        },
+    );
+    assert!(sent(&b).is_empty(), "no automatic create_session");
+    assert_eq!(get(&mut h, names::MESSAGE), "Authentication failure");
+    assert_eq!(*h.state().conversation().state(), State::User);
+    let user = named(&mut h, names::USER);
+    assert_eq!(h.ui().focused(), Some(user));
+    // The user retries by hand.
+    let path = format!("window/{}", names::USER);
+    {
+        let (ui, s) = h.parts();
+        introspect::invoke(ui, s, &path, "submit", None).unwrap();
+    }
+    h.settle();
+    assert_eq!(sent(&b), [create("alice")]);
+}
+
+#[test]
 fn a_one_time_code_after_the_password_is_asked_in_the_clear() {
     let (mut h, b) = lock_screen();
     recv(&mut h, secret("Password: "));

@@ -29,7 +29,9 @@ undecorated, focusable overlay covering the output), sends `Lock`
 (`Ui::lock_session`), which takes over an ownerless lock, and starts a
 conversation for the session's owner, so the password prompt has the
 keyboard at once. A wrong password shows PAM's reason and asks again for
-the same name. Success sends `Unlock`, closes the helper and exits 0.
+the same name. A failure the user typed nothing towards (a locked or
+expired account) is not retried by itself, which would spin PAM
+transactions; the reason stays up and Enter in the name field retries. Success sends `Unlock`, closes the helper and exits 0.
 
 A different name starts **no** conversation: another user never types a
 password into this session. The screen says "Only alice can unlock this

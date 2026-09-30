@@ -359,11 +359,16 @@ pub fn on_response(s: &mut Greeter, ui: &mut Ui<Greeter>, resp: nitro_login::Res
             return;
         }
         // A wrong password: the reason is on screen, and the same name
-        // is asked again at once. One field, not two.
+        // is asked again at once. One field, not two. Only when the user
+        // actually answered something: a failure PAM reached on its own
+        // (a locked or expired account) would otherwise loop create ->
+        // error with no input, logging and bumping faillock each time.
+        // Then the error stays up and Enter in the name field retries.
         State::User
             if s.conv
                 .last_error()
                 .is_some_and(|e| e.0 == ErrorKind::AuthError)
+                && s.conv.answered()
                 && s.conv.username() == s.owner
                 && !s.conv.busy() =>
         {
