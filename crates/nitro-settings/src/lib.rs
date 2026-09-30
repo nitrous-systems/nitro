@@ -86,6 +86,7 @@
 //! hey nitro-settings do mouse/natural_scroll toggle       # invert scrolling
 //! hey nitro-settings do appearance/overview_animate toggle # animate the overview
 //! hey nitro-settings do apply click
+//! hey nitro-settings do window[1]/confirm_keep click  # keep a display change
 //! hey nitro-settings get status value                      # applied
 //! ```
 //!
@@ -171,6 +172,18 @@
 //! [`control::RELOAD_WAIT`] is the server saying nothing, and the status
 //! line then points at the log rather than inventing a reason.
 //!
+//! An Apply that changes the **display** section asks one more question,
+//! in a second window: "Keep these display settings?", with Keep, Revert
+//! and a 30-second countdown ([`CONFIRM_TIMEOUT`]). The file is written
+//! before the dialog opens — the previous display section is captured
+//! first — and Keep leaves it so. Revert, closing the dialog, the main
+//! Revert button or the countdown running out writes the previous
+//! display section back. The timeout exists because a mode that leaves
+//! the screen blank or unreadable leaves nothing to click. Only the
+//! display section is reverted; keyboard, pointer, theme and overview
+//! keep what was applied. Quitting the app while the dialog is up keeps
+//! the new settings: the toolkit has no on-quit hook to revert from.
+//!
 //! # Audio is a remote control, not a mixer
 //!
 //! There is no audio in nitro and there is not going to be. The audio
@@ -187,6 +200,7 @@ pub mod control;
 /// `nitro-bar`'s quick settings; re-exported so paths here are unchanged.
 pub use nitro_system::{audio, conf};
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -200,10 +214,10 @@ use nitro_ui::widgets::{
     Button, Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder,
     button, checkbox, column, label, row, separator, slider, spacer, text_field,
 };
-use nitro_ui::{App, ColorRole, CrossAlign, Error, Scheme, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, CrossAlign, Error, Scheme, Size, TimerId, Ui, WidgetId, WindowId};
 
 use audio::Backend;
-use conf::{Conf, KeyboardConf};
+use conf::{Conf, KeyboardConf, OutputConf};
 
 /// The name the app registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-settings";
@@ -525,6 +539,15 @@ pub mod names {
     pub const REVERT: &str = "revert";
     /// The line that says what Apply did.
     pub const STATUS: &str = "status";
+    /// In the "Keep these display settings?" dialog (`window[1]`): the
+    /// question.
+    pub const CONFIRM_QUESTION: &str = "confirm_question";
+    /// In the dialog: the countdown, "Reverting in 30 s".
+    pub const CONFIRM_COUNTDOWN: &str = "confirm_countdown";
+    /// In the dialog: the Keep button.
+    pub const CONFIRM_KEEP: &str = "confirm_keep";
+    /// In the dialog: the Revert button.
+    pub const CONFIRM_REVERT: &str = "confirm_revert";
     /// The row holding Apply, Revert and the status line.
     ///
     /// Named rather than left as `window/container[N]`, and the reason is
@@ -614,6 +637,12 @@ struct Row {
     /// `None` when the file *did* carry a scale for this connector: the
     /// user has an explicit value, and it is written back unconditionally.
     seeded_scale: Option<f32>,
+    /// The position this row was seeded with from the live output when
+    /// the file said nothing about it, `None` when the file did. Apply
+    /// writes it back (a position line is harmless), so the confirm
+    /// dialog counts it as what the server is already running rather
+    /// than as a display change.
+    seeded_position: Option<(i32, i32)>,
     /// The row container, removed when the output goes away.
     ///
     /// A **column** of two lines since #3725, not a `control_row`: one
@@ -708,6 +737,39 @@ pub struct Settings {
     /// on it writes no line), `None` for one it does (always written
     /// back).
     seeded_pointer: conf::PointerConf,
+    /// The "Keep these display settings?" dialog, while it is open.
+    confirm: Option<Pending>,
+    /// How long that dialog waits before it reverts on its own.
+    confirm_timeout: Duration,
+    /// How many times the display section has been put back by the
+    /// dialog — Revert, closing it, or the timeout.
+    display_reverts: u64,
+}
+
+/// How long the "Keep these display settings?" dialog waits for an answer
+/// before it puts the previous display settings back by itself.
+///
+/// The point of the timeout is the case where nobody *can* answer: a
+/// scale or position that leaves the screen blank or unreadable leaves
+/// the user nothing to click, and the old settings come back on their
+/// own.
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An open "Keep these display settings?" dialog.
+#[derive(Debug)]
+struct Pending {
+    /// Its window.
+    win: WindowId,
+    /// The display section as the file had it before this Apply.
+    previous: BTreeMap<String, OutputConf>,
+    /// The one-shot that reverts when the time is up.
+    deadline: TimerId,
+    /// The one-second tick that moves the countdown, while armed.
+    tick: Option<TimerId>,
+    /// Seconds left on the countdown.
+    left: u32,
+    /// The countdown label.
+    countdown: WidgetId,
 }
 
 impl Settings {
@@ -730,6 +792,9 @@ impl Settings {
             modes: Vec::new(),
             seeded_repeat: Some(conf::REPEAT_DEFAULT),
             seeded_pointer: seed_pointer(&conf::PointerConf::default()),
+            confirm: None,
+            confirm_timeout: CONFIRM_TIMEOUT,
+            display_reverts: 0,
         }
     }
 
@@ -763,6 +828,14 @@ impl Settings {
     #[must_use]
     pub fn with_reload_wait(mut self, wait: Duration) -> Self {
         self.reload_wait = wait;
+        self
+    }
+
+    /// Wait `timeout` for an answer in the "Keep these display settings?"
+    /// dialog instead of [`CONFIRM_TIMEOUT`]. For the tests.
+    #[must_use]
+    pub fn with_confirm_timeout(mut self, timeout: Duration) -> Self {
+        self.confirm_timeout = timeout;
         self
     }
 
@@ -837,6 +910,19 @@ impl Settings {
         self.overview_writes
     }
 
+    /// Whether the "Keep these display settings?" dialog is open.
+    #[must_use]
+    pub fn confirm_pending(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// How many times that dialog has put the previous display settings
+    /// back.
+    #[must_use]
+    pub fn display_reverts(&self) -> u64 {
+        self.display_reverts
+    }
+
     /// What the status line last said.
     #[must_use]
     pub fn status(&self) -> &str {
@@ -878,6 +964,7 @@ struct Ids {
     dark: WidgetId,
     overview_animate: WidgetId,
     status: WidgetId,
+    apply: WidgetId,
 }
 
 /// Build the whole tree and return its root.
@@ -1310,6 +1397,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         dark,
         overview_animate,
         status,
+        apply: apply_button,
     };
     if let Ok(mut b) = ui.widget_mut::<Button<Settings>>(apply_button) {
         b.set_on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| apply(s, ui, ids));
@@ -1741,6 +1829,11 @@ fn add_row(
             Some(_) => None,
             None => Some(scale),
         },
+        seeded_position: if saved.and_then(|o| o.position).is_some() {
+            None
+        } else {
+            position
+        },
         container,
         mode: mode_label,
         modes: rates_label,
@@ -2065,6 +2158,9 @@ fn apply(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
         set_status(s, ui, ids, "no config path: set $HOME or $NITRO_CONFIG");
         return;
     };
+    // What the server is running now, captured before the file changes:
+    // the display section the confirm dialog puts back.
+    let previous = load_conf(s).outputs;
     let control = s.control.clone().unwrap_or_else(|| ui.control_path());
     let before = control::config_reloads_at(&control);
     if let Err(e) = conf::write(&path, &conf) {
@@ -2090,10 +2186,240 @@ fn apply(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
         )
     };
     set_status(s, ui, ids, &text);
+    if displays_differ(s, &conf.outputs, &previous) {
+        open_confirm(s, ui, ids, previous);
+    }
+}
+
+/// Whether the display section Apply just wrote would change what the
+/// server shows, compared with `previous`, the section the file had.
+///
+/// Compared as the server would *run* them rather than line for line: a
+/// connector the file said nothing about runs at its live position, and
+/// Apply writing that position down (see `Row::seeded_position`) moves
+/// nothing — so a keyboard-only Apply on a fresh file does not ask.
+fn displays_differ(
+    s: &Settings,
+    new: &BTreeMap<String, OutputConf>,
+    previous: &BTreeMap<String, OutputConf>,
+) -> bool {
+    let none = OutputConf::default();
+    new.keys().chain(previous.keys()).any(|c| {
+        let n = new.get(c).unwrap_or(&none);
+        let p = previous.get(c).unwrap_or(&none);
+        let seed = s
+            .rows
+            .iter()
+            .find(|r| r.connector == *c)
+            .and_then(|r| r.seeded_position);
+        n.scale.map(f32::to_bits) != p.scale.map(f32::to_bits)
+            || n.primary != p.primary
+            || n.position.or(seed) != p.position.or(seed)
+    })
+}
+
+/// Open the "Keep these display settings?" dialog after an Apply that
+/// changed the display section, and arm its timers.
+///
+/// The file is already written; the dialog decides whether it stays. It
+/// is a second ordinary window (`window[1]`), and the main window's Apply
+/// is disabled while it is up so there is only ever one answer pending.
+fn open_confirm(
+    s: &mut Settings,
+    ui: &mut Ui<Settings>,
+    ids: Ids,
+    previous: BTreeMap<String, OutputConf>,
+) {
+    // A second Apply cannot reach here while one is pending (the button
+    // is disabled), but a scripted one could: the older question is
+    // answered as "keep" — its settings are the ones being replaced.
+    if s.confirm.is_some() {
+        resolve_confirm(s, ui, ids, true, "");
+    }
+    let left = u32::try_from(s.confirm_timeout.as_secs()).unwrap_or(u32::MAX);
+    let question = ui.build(
+        label("Keep these display settings?")
+            .name(names::CONFIRM_QUESTION)
+            .size(HEADING_SIZE),
+    );
+    let countdown = ui.build(
+        label(countdown_text(left))
+            .name(names::CONFIRM_COUNTDOWN)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
+    // Deferred, both: the button is out of its slot while its callback
+    // runs, and resolving removes the window it sits in.
+    let keep = ui.build(
+        button("Keep")
+            .name(names::CONFIRM_KEEP)
+            .size(TEXT_SIZE)
+            .on_click(move |_s: &mut Settings, ui: &mut Ui<Settings>| {
+                ui.defer(move |s: &mut Settings, ui: &mut Ui<Settings>| {
+                    resolve_confirm(s, ui, ids, true, "");
+                });
+            }),
+    );
+    let revert_button = ui.build(
+        button("Revert")
+            .name(names::CONFIRM_REVERT)
+            .size(TEXT_SIZE)
+            .on_click(move |_s: &mut Settings, ui: &mut Ui<Settings>| {
+                ui.defer(move |s: &mut Settings, ui: &mut Ui<Settings>| {
+                    resolve_confirm(s, ui, ids, false, "");
+                });
+            }),
+    );
+    let gap = ui.build(spacer().grow(1.0));
+    let buttons = ui.build(control_row());
+    for child in [gap, revert_button, keep] {
+        let _ = ui.attach(buttons, child);
+    }
+    let root = ui.build(
+        column()
+            .gap(GAP * 2.0)
+            .padding_xy(CONTENT_GUTTER, PAD * 2.0)
+            .width_percent(1.0)
+            .cross_align(CrossAlign::Stretch),
+    );
+    for child in [question, countdown, buttons] {
+        let _ = ui.attach(root, child);
+    }
+    let win = match ui.add_window("Display Settings", None, root) {
+        Ok(win) => win,
+        Err(e) => {
+            // No dialog means nobody can say "keep": put the old
+            // settings back rather than leave an unconfirmed mode on.
+            let _ = ui.remove(root);
+            s.confirm = None;
+            revert_displays(s, ui, ids, previous, &format!("no confirm dialog: {e}"));
+            return;
+        }
+    };
+    let ms = u64::try_from(s.confirm_timeout.as_millis()).unwrap_or(u64::MAX);
+    let deadline = ui.set_timer(ms, move |s: &mut Settings, ui: &mut Ui<Settings>| {
+        // Cancelling this fired id later is a no-op: ids are not reused.
+        resolve_confirm(s, ui, ids, false, " (timed out)");
+    });
+    let tick = (left > 0).then(|| arm_tick(ui));
+    s.confirm = Some(Pending {
+        win,
+        previous,
+        deadline,
+        tick,
+        left,
+        countdown,
+    });
+    // Closing the dialog any other way — its close button, Escape, the
+    // server — is a "no". After Keep or Revert this runs too, and finds
+    // nothing pending.
+    ui.on_window_closed(win, move |s: &mut Settings, ui: &mut Ui<Settings>| {
+        resolve_confirm(s, ui, ids, false, "");
+    });
+    // Deferred: this runs inside Apply's own click, while the button is
+    // out of its slot.
+    ui.defer(move |s: &mut Settings, ui: &mut Ui<Settings>| {
+        if s.confirm.is_some()
+            && let Ok(mut b) = ui.widget_mut::<Button<Settings>>(ids.apply)
+        {
+            b.set_enabled(false);
+        }
+    });
+}
+
+/// What the countdown label says with `left` seconds to go.
+#[must_use]
+pub fn countdown_text(left: u32) -> String {
+    format!("Reverting in {left} s")
+}
+
+/// Arm the one-second countdown tick.
+fn arm_tick(ui: &mut Ui<Settings>) -> TimerId {
+    ui.set_timer(1_000, move |s: &mut Settings, ui: &mut Ui<Settings>| {
+        let Some(p) = s.confirm.as_mut() else {
+            return;
+        };
+        p.tick = None;
+        p.left = p.left.saturating_sub(1);
+        let (left, countdown) = (p.left, p.countdown);
+        set_label(ui, countdown, &countdown_text(left));
+        // Stops at zero: the deadline timer is what reverts.
+        if left > 0 {
+            let next = arm_tick(ui);
+            if let Some(p) = s.confirm.as_mut() {
+                p.tick = Some(next);
+            }
+        }
+    })
+}
+
+/// Answer the pending dialog: `keep` it, or put the previous display
+/// settings back. Idempotent — the second call finds nothing pending,
+/// which is what makes the close handler safe after Keep.
+fn resolve_confirm(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids, keep: bool, why: &str) {
+    let Some(p) = s.confirm.take() else {
+        return;
+    };
+    ui.cancel_timer(&p.deadline);
+    if let Some(t) = p.tick {
+        ui.cancel_timer(&t);
+    }
+    if ui.has_window(p.win) {
+        // The close handler runs from inside this and finds `confirm`
+        // already taken.
+        let _ = ui.remove_window(s, p.win);
+    }
+    if let Ok(mut b) = ui.widget_mut::<Button<Settings>>(ids.apply) {
+        b.set_enabled(true);
+    }
+    if keep {
+        // The file already says so: kept is persisted.
+        set_status(s, ui, ids, "kept display settings");
+    } else {
+        revert_displays(s, ui, ids, p.previous, why);
+    }
+}
+
+/// Write `previous` back as the display section, keep everything else
+/// the file says, and refill the display rows from the result.
+///
+/// Only the display section: a keyboard or pointer change made in the
+/// same Apply is not what might have blanked the screen.
+fn revert_displays(
+    s: &mut Settings,
+    ui: &mut Ui<Settings>,
+    ids: Ids,
+    previous: BTreeMap<String, OutputConf>,
+    why: &str,
+) {
+    s.display_reverts += 1;
+    let Some(path) = s.path.clone() else {
+        set_status(s, ui, ids, "no config path: set $HOME or $NITRO_CONFIG");
+        return;
+    };
+    let mut conf = load_conf(s);
+    conf.outputs = previous;
+    let control = s.control.clone().unwrap_or_else(|| ui.control_path());
+    let before = control::config_reloads_at(&control);
+    if let Err(e) = conf::write(&path, &conf) {
+        set_status(s, ui, ids, &format!("could not restore displays: {e}"));
+        return;
+    }
+    // Bounded by `reload_wait`, like Apply's: this may be running from a
+    // timer with nobody watching.
+    let tail = match control::wait_for_reload(&control, before, s.reload_wait) {
+        control::Applied::Rejected => " — server rejected: see log",
+        control::Applied::Reloaded | control::Applied::Unknown => "",
+    };
+    fill_displays(s, ui, &conf);
+    set_status(s, ui, ids, &format!("display settings reverted{why}{tail}"));
 }
 
 /// Re-read the file and put every widget back.
 fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
+    // A pending "Keep these display settings?" is answered "no" first, so
+    // the file this re-reads is the one with the old displays in it.
+    resolve_confirm(s, ui, ids, false, "");
     s.reverts += 1;
     let conf = load_conf(s);
     s.seeded_repeat = seed_repeat(&conf.keyboard);
@@ -2101,7 +2427,17 @@ fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     fill_keyboard(ui, ids, &conf.keyboard);
     fill_pointer(ui, ids, &conf.pointer);
     fill_appearance(ui, ids, &conf);
-    for r in s.rows.clone() {
+    fill_displays(s, ui, &conf);
+    // The audio section is re-read here too, deliberately: Revert means
+    // "show me what is actually true", and the volume is the one value in
+    // this window that something else can have changed behind its back.
+    load_audio(s, ui, ids);
+    set_status(s, ui, ids, "reverted");
+}
+
+/// Put every display row back to what `conf` says.
+fn fill_displays(s: &Settings, ui: &mut Ui<Settings>, conf: &Conf) {
+    for r in &s.rows {
         let saved = conf.output(&r.connector);
         let scale = saved
             .and_then(|o| o.scale)
@@ -2121,11 +2457,6 @@ fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
         set_field(ui, r.x, &x);
         set_field(ui, r.y, &y);
     }
-    // The audio section is re-read here too, deliberately: Revert means
-    // "show me what is actually true", and the volume is the one value in
-    // this window that something else can have changed behind its back.
-    load_audio(s, ui, ids);
-    set_status(s, ui, ids, "reverted");
 }
 
 /// Put the keyboard section back to what the file says.

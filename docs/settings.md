@@ -910,6 +910,32 @@ not validate layouts itself — xkbcommon is the authority on whether `de`
 compiles, and a second opinion in the client would be a second thing to
 be wrong.
 
+### Keep these display settings?
+
+An Apply that changes the display section — a scale, a position, which
+output is primary — opens a second window, **Keep these display
+settings?**, with **Keep**, **Revert** and a countdown from 30 s. The file
+is already written and the server is already running the new mode:
+
+- **Keep** leaves it so; the file is the persistence.
+- **Revert**, closing the dialog, pressing the main window's Revert, or
+  the countdown reaching zero writes the **previous display section**
+  back and refills the rows.
+
+The timeout is the reason for the dialog: a scale or position that
+leaves the screen blank or unreadable leaves you nothing to click, so the
+old settings come back by themselves. Only the display section goes back;
+a keyboard or mouse change made in the same Apply stays. Apply is
+disabled while the question is open. An Apply that changed only the
+keyboard or the mouse asks nothing. Quitting the app while the dialog is
+up keeps whatever was written — the toolkit has no on-quit hook.
+
+```console
+$ hey nitro-settings do window[1]/confirm_keep click       # keep them
+$ hey nitro-settings do window[1]/confirm_revert click     # put them back
+$ hey nitro-settings get window[1]/confirm_countdown value # Reverting in 27 s
+```
+
 ### Everything is `hey`-addressable
 
 ```console
@@ -920,6 +946,7 @@ $ hey nitro-settings do keyboard/nocaps toggle            # Caps Lock is Ctrl
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value
 applied
+$ hey nitro-settings do window[1]/confirm_keep click     # after a display change
 $ hey nitro-settings get pages value                      # 0..3
 $ hey nitro-settings get title value                      # Displays
 ```

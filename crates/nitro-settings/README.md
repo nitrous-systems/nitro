@@ -62,6 +62,32 @@ file or the new one, never a half-written one. Writing in place would let
 the compositor reload three lines, apply a scale of 1 to the primary
 output and re-apply the real one a millisecond later.
 
+## Keep these display settings?
+
+An Apply that changes the display section — a scale, a position, which
+output is primary — opens a second window, **Keep these display
+settings?**, with **Keep**, **Revert** and a countdown from 30 s. The file
+is already written and the server is already running the new mode:
+
+- **Keep** leaves it so; the file is the persistence.
+- **Revert**, closing the dialog, pressing the main window's Revert, or
+  the countdown reaching zero writes the **previous display section**
+  back and refills the rows.
+
+The timeout is the reason for the dialog: a scale or position that
+leaves the screen blank or unreadable leaves you nothing to click, so the
+old settings come back by themselves. Only the display section goes back;
+a keyboard or mouse change made in the same Apply stays. Apply is
+disabled while the question is open. An Apply that changed only the
+keyboard or the mouse asks nothing. Quitting the app while the dialog is
+up keeps whatever was written — the toolkit has no on-quit hook.
+
+```console
+$ hey nitro-settings do window[1]/confirm_keep click       # keep them
+$ hey nitro-settings do window[1]/confirm_revert click     # put them back
+$ hey nitro-settings get window[1]/confirm_countdown value # Reverting in 27 s
+```
+
 ## Limitations, and they are real
 
 **The file is rewritten wholesale.** Comments you typed and keys this app

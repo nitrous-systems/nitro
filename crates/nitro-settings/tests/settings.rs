@@ -2363,3 +2363,175 @@ fn every_heading_carries_its_icon_by_name() {
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- "Keep these display settings?" ------------------------------------
+
+/// A dialog on a fresh file with a short reload wait, ready for an Apply.
+fn confirm_harness(dir: &Path) -> Harness<Settings> {
+    let mut h = harness_in(
+        dir,
+        Settings::new()
+            .with_audio_dirs(Vec::new())
+            .with_reload_wait(Duration::from_millis(50)),
+    );
+    h.wait_for("the display rows", |h| !h.state().connectors().is_empty());
+    h.settle();
+    h
+}
+
+/// Invoke an action in the confirm dialog, `window[1]`.
+fn do_in_dialog(h: &mut Harness<Settings>, name: &str, action: &str) {
+    let (ui, state) = h.parts();
+    nitro_ui::introspect::invoke(ui, state, &format!("window[1]/{name}"), action, None)
+        .unwrap_or_else(|e| panic!("do window[1]/{name} {action}: {e}"));
+    h.settle();
+}
+
+/// The countdown label's text.
+fn countdown(h: &mut Harness<Settings>) -> String {
+    let id =
+        nitro_ui::introspect::resolve(h.ui(), &format!("window[1]/{}", names::CONFIRM_COUNTDOWN))
+            .expect("the countdown label");
+    h.widget::<Label>(id).text().to_owned()
+}
+
+/// Change the scale and the layout, and Apply: the dialog is up.
+fn apply_a_display_change(h: &mut Harness<Settings>, path: &Path) {
+    set_value(h, &format!("displays/{CONNECTOR}/scale"), "2");
+    set_field(h, names::LAYOUT, "de");
+    do_action(h, names::APPLY, "click");
+    assert!(h.state().confirm_pending(), "a display change asks");
+    assert_eq!(h.ui().windows().len(), 2, "in a second window");
+    let written = std::fs::read_to_string(path).expect("written");
+    assert!(
+        written.contains(&format!("output.{CONNECTOR}.scale = 2")),
+        "the file is written before the answer: {written}"
+    );
+}
+
+fn assert_reverted(h: &mut Harness<Settings>, path: &Path) {
+    assert!(!h.state().confirm_pending());
+    assert_eq!(h.ui().windows().len(), 1, "the dialog is gone");
+    assert_eq!(h.state().display_reverts(), 1);
+    let written = std::fs::read_to_string(path).expect("written");
+    assert!(
+        !written.contains("scale"),
+        "the display section went back: {written}"
+    );
+    assert!(
+        written.contains("keyboard.layout = de"),
+        "and the keyboard change stayed: {written}"
+    );
+    let scale = named(h, &format!("displays/{CONNECTOR}/scale"));
+    assert!(
+        (h.widget::<Slider<Settings>>(scale).value() - 1.0).abs() < 1e-6,
+        "the slider came back"
+    );
+    let apply = named(h, names::APPLY);
+    assert!(h.ui().is_enabled(apply), "Apply is usable again");
+    assert_eq!(h.next_timeout(), None, "no timer is left armed");
+}
+
+#[test]
+fn a_display_change_asks_and_keep_persists_it() {
+    let dir = scratch("confirm-keep");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = confirm_harness(&dir);
+    apply_a_display_change(&mut h, &path);
+    assert_eq!(countdown(&mut h), "Reverting in 30 s");
+    let question =
+        nitro_ui::introspect::resolve(h.ui(), &format!("window[1]/{}", names::CONFIRM_QUESTION))
+            .expect("question");
+    assert_eq!(
+        h.widget::<Label>(question).text(),
+        "Keep these display settings?"
+    );
+    let apply = named(&mut h, names::APPLY);
+    assert!(!h.ui().is_enabled(apply), "Apply waits for the answer");
+
+    do_in_dialog(&mut h, names::CONFIRM_KEEP, "click");
+    assert!(!h.state().confirm_pending());
+    assert_eq!(h.ui().windows().len(), 1, "the dialog is gone");
+    assert_eq!(h.state().display_reverts(), 0);
+    assert_eq!(status(&mut h), "kept display settings");
+    let written = std::fs::read_to_string(&path).expect("written");
+    assert!(written.contains(&format!("output.{CONNECTOR}.scale = 2")));
+    assert!(h.ui().is_enabled(apply));
+    assert_eq!(h.next_timeout(), None, "no timer is left armed");
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_dialogs_revert_puts_only_the_displays_back() {
+    let dir = scratch("confirm-revert");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = confirm_harness(&dir);
+    apply_a_display_change(&mut h, &path);
+    do_in_dialog(&mut h, names::CONFIRM_REVERT, "click");
+    assert_reverted(&mut h, &path);
+    // The harness's server never reloads, so the verdict may follow.
+    assert!(status(&mut h).starts_with("display settings reverted"));
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_countdown_runs_and_the_timeout_reverts() {
+    let dir = scratch("confirm-timeout");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = confirm_harness(&dir);
+    apply_a_display_change(&mut h, &path);
+    h.advance_timers(1_000);
+    h.run_timers();
+    h.settle();
+    assert_eq!(countdown(&mut h), "Reverting in 29 s");
+    assert!(h.state().confirm_pending());
+
+    h.advance_timers(30_000);
+    h.run_timers();
+    h.settle();
+    assert_reverted(&mut h, &path);
+    assert!(status(&mut h).starts_with("display settings reverted (timed out)"));
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn closing_the_dialog_reverts() {
+    let dir = scratch("confirm-close");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = confirm_harness(&dir);
+    apply_a_display_change(&mut h, &path);
+    let win = h.ui().windows()[1];
+    h.close_from_server(win);
+    assert_reverted(&mut h, &path);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_main_revert_answers_the_dialog_first() {
+    let dir = scratch("confirm-main-revert");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = confirm_harness(&dir);
+    apply_a_display_change(&mut h, &path);
+    do_action(&mut h, names::REVERT, "click");
+    assert_reverted(&mut h, &path);
+    assert_eq!(status(&mut h), "reverted");
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_keyboard_only_apply_does_not_ask() {
+    let dir = scratch("confirm-keyboard");
+    let mut h = confirm_harness(&dir);
+    set_field(&mut h, names::LAYOUT, "de");
+    do_action(&mut h, names::APPLY, "click");
+    assert!(!h.state().confirm_pending());
+    assert_eq!(h.ui().windows().len(), 1);
+    assert_eq!(h.next_timeout(), None);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
