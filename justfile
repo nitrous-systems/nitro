@@ -65,7 +65,7 @@ asroot_for() {
 # launcher lists nitro-demo only when it is present, so leaving it out
 # costs nothing. nitro-session finds the rest next to itself in $BINDIR
 # (crates/nitro-session/src/pieces.rs), so they are installed as one set.
-install_bins := "nitro-server nitro-session nitro-shot nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings nitro-video nitro-greeter nitro-auth hey"
+install_bins := "nitro-server nitro-gpu-vulkan nitro-session nitro-shot nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings nitro-video nitro-greeter nitro-auth hey"
 
 # Chromium on nitro (#3865). A **release, non-component** build of the
 # `nitro-ozone` branch in the Chromium checkout. Neither install-chromium

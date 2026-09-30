@@ -52,12 +52,18 @@ the shell does not expand `~`.
 | `install-apparmor` | optional, see below |
 | `uninstall` | removes all of the above except the AppArmor profile |
 
-**Binaries:** nitro-server, nitro-session, nitro-shot, nitro-calc,
-nitro-amp, nitro-term, nitro-files, nitro-bar, nitro-launcher,
+**Binaries:** nitro-server, nitro-gpu-vulkan, nitro-session, nitro-shot,
+nitro-calc, nitro-amp, nitro-term, nitro-files, nitro-bar, nitro-launcher,
 nitro-wallpaper, nitro-settings, nitro-video, nitro-greeter, nitro-auth,
 hey. The test box also gets nitro-demo,
 nitro-bench and the examples. Those are development and measurement
 tools and are not installed.
+
+`nitro-gpu-vulkan` is the server's GPU helper; the server finds it next
+to itself, else on `$PATH`. It dlopens libvulkan, so the build needs no
+Vulkan packages and libvulkan plus a Vulkan driver are only needed at run
+time, on boxes that use the helper.
+
 
 **They are one set.** `nitro-session` starts the server, bar, launcher and
 wallpaper from its own directory first and uses `$PATH` only as a
