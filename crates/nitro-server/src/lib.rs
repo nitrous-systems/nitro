@@ -6826,7 +6826,12 @@ impl Server {
                 None => {
                     let (total, recs) = self.timeline.records();
                     let rows: Vec<_> = recs.iter().map(timeline::FrameRecord::columns).collect();
-                    protocol::timeline_reply(self.timeline.enabled(), total, timeline::HEADER, &rows)
+                    protocol::timeline_reply(
+                        self.timeline.enabled(),
+                        total,
+                        timeline::HEADER,
+                        &rows,
+                    )
                 }
                 Some(protocol::TimelineOp::On) => {
                     self.timeline.set_enabled(true);
@@ -10647,7 +10652,8 @@ impl Server {
             {
                 client.unpresented.push(l.serial);
                 out.painting.push((l.client.0, l.serial));
-                self.timeline.latch(out.scene_id.0, client.unpresented.len());
+                self.timeline
+                    .latch(out.scene_id.0, client.unpresented.len());
             } else {
                 // Nowhere to appear: answer at once, the commit rule.
                 let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {

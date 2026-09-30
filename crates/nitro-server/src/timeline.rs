@@ -158,15 +158,14 @@ struct Ring {
 
 impl Ring {
     fn output(&mut self, output: u32) -> &mut OutputStages {
-        let i = match self.outputs.iter().position(|o| o.output == output) {
-            Some(i) => i,
-            None => {
-                self.outputs.push(OutputStages {
-                    output,
-                    ..OutputStages::default()
-                });
-                self.outputs.len() - 1
-            }
+        let i = if let Some(i) = self.outputs.iter().position(|o| o.output == output) {
+            i
+        } else {
+            self.outputs.push(OutputStages {
+                output,
+                ..OutputStages::default()
+            });
+            self.outputs.len() - 1
         };
         &mut self.outputs[i]
     }
@@ -387,9 +386,9 @@ impl Timeline {
     /// Records ever taken, and the retained ones oldest first.
     #[must_use]
     pub fn records(&self) -> (u64, Vec<FrameRecord>) {
-        self.ring
-            .as_deref()
-            .map_or((0, Vec::new()), |r| (r.total, r.records.iter().copied().collect()))
+        self.ring.as_deref().map_or((0, Vec::new()), |r| {
+            (r.total, r.records.iter().copied().collect())
+        })
     }
 }
 
@@ -460,7 +459,9 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(
             recs[0].columns(),
-            [3, 9, 100, 105, 110, 110, 130, 140, 150, 160, 170, 180, 105, 0, 2]
+            [
+                3, 9, 100, 105, 110, 110, 130, 140, 150, 160, 170, 180, 105, 0, 2
+            ]
         );
         assert_eq!(HEADER.split(' ').count(), recs[0].columns().len());
     }

@@ -429,7 +429,11 @@ fn the_timeline_records_a_scroll_stage_by_stage() {
         assert_eq!(lines[0], nitro_server::timeline::HEADER);
         lines[1..]
             .iter()
-            .map(|l| l.split(' ').map(|v| v.parse::<u64>().unwrap()).collect::<Vec<_>>())
+            .map(|l| {
+                l.split(' ')
+                    .map(|v| v.parse::<u64>().unwrap())
+                    .collect::<Vec<_>>()
+            })
             .filter(|r| r[5] != 0)
             .collect::<Vec<_>>()
     };
