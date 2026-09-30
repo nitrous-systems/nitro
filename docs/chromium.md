@@ -79,6 +79,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **Minimize** (titlebar button): the window unmaps, chrome stays alive, and the server's frame count stays flat, so there is no busy loop and no stall.
 - **Clipboard** (#3943): copy and paste both ways with native nitro clients, on testhost2. See [Clipboard](#clipboard-3943).
 - **Drag and drop** (#3965): Chromium ↔ Chromium over the DATA ops, with the drag image shown by the server; every cancel path ends both sides. See [Drag and drop](#drag-and-drop-3965).
+- **Screen sharing** (#676 D): `getDisplayMedia` shares a whole output, on box1 and testhost2. See [Screen sharing](#screen-sharing-676-d).
 
 ## What doesn't / is not verified
 
@@ -615,6 +616,74 @@ blend-bound. The HSW GT1 GPU keeps up at 61 fps.
   dma-buf over the shadow, exact result) passes on the KBL GPU.
 - **Corners not checked by eye.** `nitro-shot` does not capture helper
   content (#3962), so there is no screenshot of the rounded corners.
+
+## Screen sharing (#676 D)
+
+`getDisplayMedia` / WebRTC desktop capture of a **whole output**, over the
+server's capture ops (`docs/wire.md` § Screen capture, design in
+`docs/surfaces.md` § Capture).
+
+- **Capturer.** `ui/ozone/platform/nitro/nitro_desktop_capturer.{h,cc}`, a
+  `webrtc::DesktopCapturer` in its own GN target (`:desktop_capturer`,
+  which depends on WebRTC; the platform itself does not).
+  `content::desktop_capture::CreateScreenCapturer`
+  (`content/public/browser/desktop_capture.cc`) returns it when the Ozone
+  platform is `nitro` (built only with `ozone_platform_nitro`).
+- **Process and connection.** It runs in the **browser process** on the
+  thread WebRTC uses (`DesktopCaptureDevice`'s capture thread, or the
+  picker's worker), on **its own wire connection** (`chromium-capture`,
+  `caps::CAPTURE | caps::OUTPUTS` in `ClientCaps`), opened lazily there. It
+  never touches the UI connection, so nothing crosses threads. The server
+  judges permission on this connection (#676 C: the prompt names the
+  client).
+- **Sources and picker.** One screen per `OutputInfo` (`ListOutputs`), titled
+  by the output name; `kFullDesktopScreenId` is the first output (no
+  spanning virtual desktop). The picker's thumbnail capturer
+  (`for_snapshot`) lists the outputs but **captures nothing**: a capture
+  there would allocate a ring and ask the user before they chose. The
+  picker shows "Entire screen" with no preview.
+- **Frames.** `CaptureStart{output, max_fps}` gets `CaptureBuffers` (3 LINEAR
+  XR24 slots, mapped read-only; a non-LINEAR ring is a permanent error) and
+  `CaptureFrame`s. `CaptureFrame()` never blocks: it drains the socket,
+  takes the newest frame whose `sync_file` has signalled, releases the older
+  ones (their damage carries over), copies only the accumulated damage from
+  the slot into a persistent `SharedDesktopFrame` (under
+  `DMA_BUF_IOCTL_SYNC`), releases the slot, and delivers with
+  `updated_region` = that damage. No new frame → the same frame with an empty
+  updated region, which `DesktopCaptureDevice`'s zero-hertz mode skips.
+  `DesktopCaptureDevice` now passes the requested frame rate to
+  `SetMaxFrameRate` (a one-line change in
+  `content/browser/media/capture/desktop_capture_device.cc`), so the server
+  paces at what the page asked for rather than the output's refresh.
+- **Cursor.** nitro's cursor is software, in the shadow, so it is **always
+  in the captured pixels**. There is no cursor metadata;
+  `DesktopAndCursorComposer` gets no cursor monitor on this platform
+  (`MouseCursorMonitor::Create` returns null without X11/PipeWire), so the
+  cursor is not drawn twice.
+- **Ends.** Any `CaptureStopped` other than `Client` (denied, locked, output
+  gone, helper lost, revoked, unsupported) is `ERROR_PERMANENT`: the page's
+  track ends. Closing the tab or "Stop sharing" destroys the capturer, which
+  sends `CaptureStop` and unmaps; closing the connection frees the ring.
+- **Not zero-copy.** WebRTC's `DesktopCapturer` takes CPU frames, so the
+  damage is copied out of the mapped slot (2.3–2.7 ms per frame at 1440p on
+  testhost2, 3.9–5.4 ms at 1080p on box1). Importing the slot dma-buf as a
+  `media::VideoFrame` (GpuMemoryBuffer, NV12 conversion on the GPU) needs a
+  `VideoCaptureDevice` of its own instead of a `DesktopCapturer`: a
+  follow-up, as is window capture.
+- **Limits.** One output per capture; the picker has no thumbnails; the
+  received rate in a loopback test is bounded by Chromium's software VP8
+  encode (8–10 fps at 1080p on box1, 15–21 at 1440p on testhost2), not by
+  the capture (24–28 fps delivered to WebRTC at 30 asked).
+- **Test.** `just chromium-share [SECS] [FPS]` (deploy/chromium-share.sh):
+  a page calls `getDisplayMedia` (the picker auto-selects via
+  `--auto-select-screen-capture-source`), loops it through an
+  `RTCPeerConnection`, draws the received stream to a canvas and reports
+  received fps and a luma-spread content check; with `nitro-video
+  --synthetic` playing and the page's GPU canvas animating. It also measures
+  display fps off vs recording, CPU, the server's capture counters and
+  dma-buf memory. Needs a server that grants the capture
+  (`NITRO_CAPTURE_ALLOW=1` until #676 C's prompt). Measurements:
+  `docs/budget.md` § Chromium screen sharing.
 
 ## Other gotchas
 

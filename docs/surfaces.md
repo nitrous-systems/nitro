@@ -684,7 +684,10 @@ adds capture rings **beside** the output ring. The server uses them for recordin
 - **Test client.** `nitro-shot --record N [--output NAME] [--fps F] [-o
   FILE]`: maps LINEAR slots after the fence, prints fps, flip→fence
   latency, damage, ring size; `-o` writes the last frame as PNG.
-- **Not built.** NV12 target, window capture, Chromium (#676 D).
+- **Chromium** (#676 D): `NitroDesktopCapturer` maps the LINEAR slots and
+  copies the damage into WebRTC frames (docs/chromium.md § Screen sharing);
+  the design above is unchanged.
+- **Not built.** NV12 target, window capture, zero-copy import in Chromium.
 
 ### As built: permission, indicator, border, lock (#676 C)
 
