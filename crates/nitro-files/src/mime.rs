@@ -837,9 +837,8 @@ mod tests {
             &dir.join("data/applications/nitro-video.desktop"),
             "[Desktop Entry]\nName=video\nExec=nitro-video %f\nMimeType=video/x-theora+ogg;\n",
         );
-        let globs = parse_globs2(
-            "50:audio/ogg:*.ogg\n50:video/ogg:*.ogg\n50:video/x-theora+ogg:*.ogg\n",
-        );
+        let globs =
+            parse_globs2("50:audio/ogg:*.ogg\n50:video/ogg:*.ogg\n50:video/x-theora+ogg:*.ogg\n");
         let file = dir.join("song.ogg");
         write(&file, "");
         assert_eq!(
