@@ -497,21 +497,29 @@ fn every_selection_change_updates_the_status_line() {
     h.click_at(Point::new(b.x + 20.0, b.y + row_h * 1.5));
     h.settle();
     assert_eq!(h.widget::<List<Files>>(ids.list).cursor(), 1);
-    assert_eq!(status(&h, ids), "3 items, 1 selected", "a click counts");
+    assert_eq!(
+        status(&h, ids),
+        "3 items, 1 selected (5 B)",
+        "a click counts"
+    );
 
     // Shift-Up extends to two rows.
     h.key_with(key::LEFT_SHIFT, key::UP);
     h.settle();
     assert_eq!(
         status(&h, ids),
-        "3 items, 2 selected",
+        "3 items, 2 selected (10 B)",
         "Shift-extend counts"
     );
 
     // A plain arrow collapses it back to one.
     h.key(key::DOWN);
     h.settle();
-    assert_eq!(status(&h, ids), "3 items, 1 selected", "an arrow counts");
+    assert_eq!(
+        status(&h, ids),
+        "3 items, 1 selected (5 B)",
+        "an arrow counts"
+    );
 
     // Ctrl-Space toggles the cursor's row off, without moving.
     h.key_with(key::LEFT_CTRL, key::SPACE);
@@ -540,14 +548,59 @@ fn shift_and_ctrl_clicks_select_several_rows_and_the_status_counts_them() {
     h.settle();
     h.key_up(key::LEFT_SHIFT);
     assert_eq!(h.widget::<List<Files>>(ids.list).selection(), vec![1, 2, 3]);
-    assert_eq!(status(&h, ids), "5 items, 3 selected", "Shift-click counts");
+    assert_eq!(
+        status(&h, ids),
+        "5 items, 3 selected (15 B)",
+        "Shift-click counts"
+    );
 
     h.key_down(key::LEFT_CTRL);
     h.click_at(at(2));
     h.settle();
     h.key_up(key::LEFT_CTRL);
     assert_eq!(h.widget::<List<Files>>(ids.list).selection(), vec![1, 3]);
-    assert_eq!(status(&h, ids), "5 items, 2 selected", "Ctrl-click counts");
+    assert_eq!(
+        status(&h, ids),
+        "5 items, 2 selected (10 B)",
+        "Ctrl-click counts"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn the_status_line_totals_the_selected_sizes_and_leaves_folders_out() {
+    // Directories are listed first, so the rows are `sub`, `big`, `small`.
+    let (root, dir) = fixture("selsize");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    write(&dir.join("big"), &"x".repeat(1500));
+    write(&dir.join("small"), &"y".repeat(500));
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let b = h.bounds(ids.list);
+    let row_h = h.widget::<List<Files>>(ids.list).row_height();
+    let at = |row: usize| Point::new(b.x + 20.0, b.y + row_h * (row as f32 + 0.5));
+
+    h.click_at(at(0));
+    h.settle();
+    assert_eq!(status(&h, ids), "3 items, 1 selected (1 folder)");
+
+    h.key_down(key::LEFT_SHIFT);
+    h.click_at(at(2));
+    h.settle();
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(
+        status(&h, ids),
+        "3 items, 3 selected (2 files, 1 folder: 2.0 kB+)"
+    );
+
+    h.click_at(at(1));
+    h.settle();
+    h.key_down(key::LEFT_SHIFT);
+    h.click_at(at(2));
+    h.settle();
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(status(&h, ids), "3 items, 2 selected (2.0 kB)");
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();

@@ -35,7 +35,7 @@ written down.
  │   Downloads  │   photo.png         4.2 MB  2024-02-11 21:40     │
  │ ─────────    │ [ name                                         ] │  TextField `edit`
  │   Root       ├──────────────────────────────────────────────────┤   (height 0 when idle)
- │   Trash      │ 4 items, 1 selected — copied notes.txt           │  Label `status`
+ │   Trash      │ 4 items, 1 selected (912 B) — copied notes.txt   │  Label `status`
  └──────────────┴──────────────────────────────────────────────────┘
        sidebar        │                                    ▲
    `places/place_*`   │ activate                           │ entries
@@ -50,6 +50,15 @@ on the left, and on the right a header (back, up, the path bar), the
 list with rounded inset selection rows (`List::row_inset`/`row_radius`),
 and the status line as a footer under a hairline. The list is not in a
 `Scroll` — it scrolls itself, which is the whole point of it.
+
+The status line counts the rows and the selection, and with something
+selected adds its total size: `3 items, 2 selected (12.4 MB)`.
+Directories are left out of the total rather than walked — a `du` on
+every selection change would block or need a thread — so a selection
+with folders names its parts and marks the total partial with a
+trailing `+`: `(2 files, 1 folder: 12.4 MB+)`, or just `(1 folder)`.
+Symlinks that are not to directories count as files but are not summed
+either (their size is the link's), and also make the total `+`.
 
 Seven widgets plus the sidebar, five modules and no dialogs. The
 modules — `dir`, `mime`, `trash`, `ops`, `places` — contain no widget code at all and are tested without a
@@ -925,7 +934,7 @@ than pushes, so Back, Back does not oscillate.
 hey nitro-files set path value /tmp     # navigate
 hey nitro-files get list text           # the visible rows
 hey nitro-files do list activate        # enter the selected row
-hey nitro-files get status value        # "4 items, 1 selected"
+hey nitro-files get status value        # "4 items, 1 selected (912 B)"
 hey nitro-files do places/place_home click   # a sidebar row
 hey nitro-files do back click
 ```

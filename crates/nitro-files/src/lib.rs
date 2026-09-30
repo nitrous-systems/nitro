@@ -10,7 +10,7 @@
 //! │   Documents  │   notes.txt                        912 B   │
 //! │ ─────────    │   photo.png                        4.2 MB  │
 //! │   Root       ├────────────────────────────────────────────┤
-//! │   Trash      │ 4 items, 1 selected                        │  status line
+//! │   Trash      │ 4 items, 1 selected (4.2 MB)               │  status line
 //! └──────────────┴────────────────────────────────────────────┘
 //! ```
 //!
@@ -68,7 +68,7 @@
 //! hey nitro-files set path value /tmp     # navigate
 //! hey nitro-files get list text           # the visible rows
 //! hey nitro-files do list activate        # enter the selected row
-//! hey nitro-files get status value        # "4 items, 1 selected"
+//! hey nitro-files get status value        # "4 items, 1 selected (4.2 MB)"
 //! ```
 //!
 //! The list answers its **visible** rows rather than its model, which is
@@ -526,6 +526,64 @@ impl Files {
     #[must_use]
     pub fn path_at(&self, index: usize) -> Option<PathBuf> {
         self.shown().get(index).map(|e| self.cwd.join(&e.name))
+    }
+
+    /// The size part of the status line for the rows at `indices`:
+    /// `""` when nothing is selected, else parenthesised — `(12.4 MB)`
+    /// when every row is a sized file, `(2 files, 1 folder: 12.4 MB+)`
+    /// when some are not, `(2 folders)` when none is.
+    ///
+    /// Directories are left out of the total rather than walked: a `du`
+    /// of a selected tree would block or need a thread, and the status
+    /// line is written on every selection change. So the rule is:
+    /// `Kind::File` and `Kind::Other` are summed; `Kind::Dir` and a
+    /// symlink to a directory count as folders and are not summed; any
+    /// other symlink counts as a file but is not summed either (its size
+    /// is the link's, not the target's). Anything not summed makes the
+    /// total partial, marked with a trailing `+`. Out-of-range indices
+    /// are ignored.
+    #[must_use]
+    pub fn selection_summary(&self, indices: &[usize]) -> String {
+        let (mut files, mut folders, mut total, mut partial) = (0usize, 0usize, 0u64, false);
+        for e in indices.iter().filter_map(|&i| self.entry_at(i)) {
+            if e.opens_a_directory() {
+                folders += 1;
+                partial = true;
+            } else {
+                files += 1;
+                if matches!(e.kind, Kind::File | Kind::Other) {
+                    total = total.saturating_add(e.size);
+                } else {
+                    partial = true;
+                }
+            }
+        }
+        if files + folders == 0 {
+            return String::new();
+        }
+        let size = format!(
+            "{}{}",
+            dir::format_bytes(total),
+            if partial { "+" } else { "" }
+        );
+        if !partial {
+            return format!("({size})");
+        }
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if files > 0 {
+            parts.push(plural(files, "file", "files"));
+        }
+        if folders > 0 {
+            parts.push(plural(folders, "folder", "folders"));
+        }
+        let what = parts.join(", ");
+        if files == 0 {
+            format!("({what})")
+        } else {
+            format!("({what}: {size})")
+        }
     }
 
     /// The entry at `index` of the shown rows.
@@ -1528,11 +1586,16 @@ pub fn show_status(s: &mut Files, ui: &mut Ui<Files>) {
     let Some(ids) = s.ids else {
         return;
     };
-    let selected = ui
+    let selection: Vec<usize> = ui
         .widget::<List<Files>>(ids.list)
-        .map(|l| l.selection().len())
+        .map(List::selection)
         .unwrap_or_default();
-    let counts = format!("{} items, {selected} selected", s.shown().len());
+    let mut counts = format!("{} items, {} selected", s.shown().len(), selection.len());
+    let summary = s.selection_summary(&selection);
+    if !summary.is_empty() {
+        counts.push(' ');
+        counts.push_str(&summary);
+    }
     let text = match s.status() {
         t if t.is_empty() => counts,
         t => format!("{counts} — {t}"),
