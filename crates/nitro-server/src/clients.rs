@@ -1013,6 +1013,9 @@ fn apply_msg(
         }
         ClientMsg::PresentSurface(_)
         | ClientMsg::PresentSurfaceFenced(_)
+        | ClientMsg::CaptureStart(_)
+        | ClientMsg::CaptureRelease(_)
+        | ClientMsg::CaptureStop(_)
         | ClientMsg::ExportSurface(_)
         | ClientMsg::ImportSurface(_)
         | ClientMsg::AllocSurfaceBuffers(_) => {

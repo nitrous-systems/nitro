@@ -453,6 +453,8 @@ pub fn needs_fd(op: u16) -> bool {
         || op == msg::SurfaceBufferAllocated::OP
         || op == msg::CreateDmabufBuffer::OP
         || op == msg::PresentSurfaceFenced::OP
+        || op == msg::CaptureBuffers::OP
+        || op == msg::CaptureFrame::OP
 }
 
 /// Whether an op is about a **buffer**, and so cannot mean anything on a

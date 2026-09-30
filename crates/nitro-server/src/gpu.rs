@@ -346,6 +346,31 @@ pub enum Reply {
         /// The pixels.
         memfd: OwnedFd,
     },
+    /// A capture ring (#676) was allocated: one dma-buf per slot.
+    CaptureRing {
+        /// The server's ring id.
+        ring_id: u32,
+        /// Size.
+        size: (u32, u32),
+        /// Fourcc.
+        fourcc: u32,
+        /// Modifier the helper picked.
+        modifier: u64,
+        /// Per-slot layout and dma-buf.
+        slots: Vec<(proto::SlotLayout, OwnedFd)>,
+    },
+    /// A capture ring could not be allocated.
+    CaptureRingFailed {
+        /// The server's ring id.
+        ring_id: u32,
+    },
+    /// A recording frame (`CaptureComposite`) was refused.
+    CaptureCompositeFailed {
+        /// Serial.
+        serial: u64,
+        /// The code.
+        code: proto::ErrorCode,
+    },
     /// A shot's capture was refused.
     CaptureFailed {
         /// Serial.
@@ -435,8 +460,12 @@ pub struct Helper {
     want_out: bool,
     /// Last activity towards the helper that holds something (on-demand).
     pub busy_since_idle: bool,
-    /// Shot captures sent and not answered (#3962): serial, sent at.
+    /// Shot captures and recording frames sent and not answered (#3962,
+    /// #676): serial, sent at.
     captures: Vec<(u64, Instant)>,
+    /// When a recording frame held back by its rate cap is due (#676):
+    /// the timer fires then so the last change of a burst is not lost.
+    pub capture_due: Option<Instant>,
 }
 
 impl std::fmt::Debug for Helper {
@@ -506,6 +535,7 @@ impl Helper {
             want_out: false,
             busy_since_idle: false,
             captures: Vec::new(),
+            capture_due: None,
         })
     }
 
@@ -775,6 +805,12 @@ impl Helper {
                 match op {
                     proto::op::COMPOSITE => Some(Reply::CompositeFailed { serial: what, code }),
                     proto::op::CAPTURE => Some(Reply::CaptureFailed { serial: what, code }),
+                    proto::op::CAPTURE_COMPOSITE => {
+                        Some(Reply::CaptureCompositeFailed { serial: what, code })
+                    }
+                    proto::op::ALLOC_CAPTURE_RING => Some(Reply::CaptureRingFailed {
+                        ring_id: u32::try_from(what).unwrap_or(u32::MAX),
+                    }),
                     proto::op::ALLOC_OUTPUT_RING => Some(Reply::RingFailed),
                     proto::op::IMPORT_SHADOW => {
                         ring.shadow = None;
@@ -812,10 +848,21 @@ impl Helper {
                     memfd,
                 })
             }
-            // Capture rings (v3) are not requested yet (#676 B).
-            FromHelper::Imported { .. }
-            | FromHelper::ReadBackReply { .. }
-            | FromHelper::CaptureRing { .. } => None,
+            FromHelper::CaptureRing {
+                ring_id,
+                w,
+                h,
+                fourcc,
+                modifier,
+                slots,
+            } => Some(Reply::CaptureRing {
+                ring_id,
+                size: (w, h),
+                fourcc,
+                modifier,
+                slots: slots.into_iter().zip(fds).collect(),
+            }),
+            FromHelper::Imported { .. } | FromHelper::ReadBackReply { .. } => None,
         }
     }
 
@@ -960,10 +1007,16 @@ impl Helper {
     pub fn arm(&mut self) {
         let hang = self.ring.in_flight.as_ref().map(|f| f.sent + HANG_TIMEOUT);
         let capture = self.captures.iter().map(|c| c.1 + CAPTURE_TIMEOUT).min();
-        let next = [self.hello_at, self.respawn_at, hang, capture]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [
+            self.hello_at,
+            self.respawn_at,
+            hang,
+            capture,
+            self.capture_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let Some(t) = rearm(self.armed, next) else {
             return;
         };

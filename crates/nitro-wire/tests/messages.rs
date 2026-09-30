@@ -9,7 +9,8 @@ use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     AcceptDrop, AllocSurfaceBuffers, AllocSurfaceBuffersFailed, BindKey, BufferDamage,
-    BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
+    BufferReleased, CaptureBuffers, CaptureFrame, CaptureRelease, CaptureStart, CaptureStop,
+    CaptureStopped, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
     CreateDmabufBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer,
     DestroyNode, DmabufFeedback, DmabufPlane, DragDrop, DragEnter, DragFinished, DragLeave,
     DragMotion, Error as ErrorMsg, ExportSurface, Fill, FinishDrag, Focus, FocusWindow, Frame,
@@ -27,12 +28,12 @@ use nitro_wire::msg::{
     WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
-    CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
-    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
-    WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust, dmabuf_flags,
-    drag_actions, format, mod_mask, modifier, plane_hint_flags, popup_flags, resize_edges,
-    window_flags,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureKind, CaptureSlot,
+    CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat,
+    DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest,
+    PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState as WindowStateValue,
+    anchor, caps, constraint_adjust, dmabuf_flags, drag_actions, format, mod_mask, modifier,
+    plane_hint_flags, popup_flags, resize_edges, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -600,6 +601,20 @@ fn client_messages() -> Vec<ClientMsg> {
             fence: memfd("fence", 1),
         }
         .into(),
+        CaptureStart {
+            capture_id: 94,
+            kind: CaptureKind::Output,
+            output: 95,
+            max_fps: 30,
+            format: format::XR24,
+        }
+        .into(),
+        CaptureRelease {
+            capture_id: 96,
+            slot: 2,
+        }
+        .into(),
+        CaptureStop { capture_id: 97 }.into(),
     ]
 }
 
@@ -940,6 +955,35 @@ fn server_messages() -> Vec<ServerMsg> {
             flags: plane_hint_flags::SCALE_LIMITED,
         }
         .into(),
+        CaptureBuffers {
+            capture_id: 98,
+            width: 2560,
+            height: 1440,
+            format: format::XR24,
+            modifier: modifier::LINEAR,
+            slots: (0..3)
+                .map(|i| CaptureSlot {
+                    fd: memfd("capture-slot", 4096),
+                    offset: i,
+                    pitch: 10240,
+                    size: 10240 * 1440,
+                })
+                .collect(),
+        }
+        .into(),
+        CaptureFrame {
+            capture_id: 99,
+            slot: 1,
+            time_ns: 0x0102_0304_0506,
+            damage: vec![IRect::new(1, 2, 3, 4), IRect::new(5, 6, 7, 8)],
+            fence: memfd("capture-fence", 1),
+        }
+        .into(),
+        CaptureStopped {
+            capture_id: 100,
+            reason: CaptureStopReason::HelperLost,
+        }
+        .into(),
         DmabufFeedback {
             id: NodeId(92),
             main_device: 0,
@@ -1050,7 +1094,9 @@ fn server_fd_count(msg: &ServerMsg) -> usize {
     match msg {
         ServerMsg::Keymap(_)
         | ServerMsg::SelectionData(_)
-        | ServerMsg::SurfaceBufferAllocated(_) => 1,
+        | ServerMsg::SurfaceBufferAllocated(_)
+        | ServerMsg::CaptureFrame(_) => 1,
+        ServerMsg::CaptureBuffers(m) => m.slots.len(),
         _ => 0,
     }
 }
@@ -1786,6 +1832,105 @@ fn the_m5_payload_layouts_are_frozen() {
         ]
     );
 
+    // #676: the capture ops. `CaptureStart` 17 bytes, `CaptureRelease` 5,
+    // `CaptureStop` 4, `CaptureStopped` 5; `CaptureBuffers` a 25-byte head
+    // + 16 bytes per slot and one fd per slot; `CaptureFrame` 13 bytes +
+    // `vec<IRect>` and one fd.
+    let mut w = Writer::new();
+    ClientMsg::from(CaptureStart {
+        capture_id: 0x0102_0304,
+        kind: CaptureKind::Output,
+        output: 5,
+        max_fps: 30,
+        format: format::XR24,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            17, 0, 0, 0, 0x15, 0x03, 0, 0, // header
+            0x04, 0x03, 0x02, 0x01, // capture_id
+            0,    // kind: output
+            5, 0, 0, 0, // output
+            30, 0, 0, 0, // max_fps
+            b'X', b'R', b'2', b'4', // format
+        ]
+    );
+    let mut w = Writer::new();
+    ClientMsg::from(CaptureRelease {
+        capture_id: 7,
+        slot: 2,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &[5, 0, 0, 0, 0x16, 0x03, 0, 0, 7, 0, 0, 0, 2]);
+    let mut w = Writer::new();
+    ClientMsg::from(CaptureStop { capture_id: 7 })
+        .encode(&mut w)
+        .unwrap();
+    assert_eq!(w.bytes(), &[4, 0, 0, 0, 0x17, 0x03, 0, 0, 7, 0, 0, 0]);
+    let mut w = Writer::new();
+    ServerMsg::from(CaptureStopped {
+        capture_id: 7,
+        reason: CaptureStopReason::Denied,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &[5, 0, 0, 0, 0x0f, 0x83, 0, 0, 7, 0, 0, 0, 1]);
+    let mut w = Writer::new();
+    ServerMsg::from(CaptureBuffers {
+        capture_id: 7,
+        width: 2,
+        height: 3,
+        format: format::XR24,
+        modifier: 0x0100_0000_0000_0001,
+        slots: vec![CaptureSlot {
+            fd: memfd("golden-slot", 64),
+            offset: 4,
+            pitch: 8,
+            size: 24,
+        }],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            41, 0, 0, 0, 0x0d, 0x83, 1, 0, // header: 41 bytes, 1 fd
+            7, 0, 0, 0, // capture_id
+            2, 0, 0, 0, // width
+            3, 0, 0, 0, // height
+            b'X', b'R', b'2', b'4', // format
+            1, 0, 0, 0, 0, 0, 0, 1, // modifier
+            1, // count
+            4, 0, 0, 0, // offset
+            8, 0, 0, 0, // pitch
+            24, 0, 0, 0, 0, 0, 0, 0, // size
+        ]
+    );
+    let mut w = Writer::new();
+    ServerMsg::from(CaptureFrame {
+        capture_id: 7,
+        slot: 1,
+        time_ns: 9,
+        damage: vec![IRect::new(1, 2, 3, 4)],
+        fence: memfd("golden-fence", 1),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            33, 0, 0, 0, 0x0e, 0x83, 1, 0, // header: 33 bytes, 1 fd
+            7, 0, 0, 0, // capture_id
+            1, // slot
+            9, 0, 0, 0, 0, 0, 0, 0, // time_ns
+            1, 0, 0, 0, // damage count
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, // rect
+        ]
+    );
+
     let mut w = Writer::new();
     ClientMsg::from(RepositionPopup {
         id: NodeId(0x0102_0304),
@@ -2377,6 +2522,9 @@ fn the_m5_ops_are_where_the_doc_says() {
         (AllocSurfaceBuffers::OP, 0x0300),
         (CreateDmabufBuffer::OP, 0x0300),
         (PresentSurfaceFenced::OP, 0x0300),
+        (CaptureStart::OP, 0x0300),
+        (CaptureRelease::OP, 0x0300),
+        (CaptureStop::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2395,6 +2543,9 @@ fn the_m5_ops_are_where_the_doc_says() {
         (AllocSurfaceBuffersFailed::OP, 0x8300),
         (DmabufFeedback::OP, 0x8300),
         (SurfacePlaneHint::OP, 0x8300),
+        (CaptureBuffers::OP, 0x8300),
+        (CaptureFrame::OP, 0x8300),
+        (CaptureStopped::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2435,6 +2586,12 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(PresentSurfaceFenced::OP, 0x0314);
     assert_eq!(DmabufFeedback::OP, 0x830b);
     assert_eq!(SurfacePlaneHint::OP, 0x830c);
+    assert_eq!(CaptureStart::OP, 0x0315);
+    assert_eq!(CaptureRelease::OP, 0x0316);
+    assert_eq!(CaptureStop::OP, 0x0317);
+    assert_eq!(CaptureBuffers::OP, 0x830d);
+    assert_eq!(CaptureFrame::OP, 0x830e);
+    assert_eq!(CaptureStopped::OP, 0x830f);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.

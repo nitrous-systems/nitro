@@ -266,6 +266,61 @@ tag_enum! {
     }
 }
 
+tag_enum! {
+    /// What a [`CaptureStart`](crate::msg::CaptureStart) captures (#676).
+    /// Only whole outputs exist; the byte is reserved so a window capture
+    /// (`1`, one window's subtree into a window-sized ring) can be added
+    /// without a new op. Anything unlisted is a decode error.
+    CaptureKind: u8 {
+        /// A whole output, named by its `OutputInfo` id.
+        Output = 0,
+    }
+}
+
+tag_enum! {
+    /// Why a capture ended, or was never started (#676):
+    /// [`CaptureStopped`](crate::msg::CaptureStopped). Not an error: the
+    /// connection carries on and the id is free again.
+    CaptureStopReason: u8 {
+        /// The client sent `CaptureStop`.
+        Client = 0,
+        /// The client may not capture (no grant, or the user said no).
+        Denied = 1,
+        /// The session is locked: no lock-screen frame is ever captured.
+        Locked = 2,
+        /// The output went away (or never existed).
+        OutputGone = 3,
+        /// The GPU helper died; the ring went with it.
+        HelperLost = 4,
+        /// The grant was revoked (the shell, or a policy reload).
+        Revoked = 5,
+        /// The server cannot capture: no GPU helper (`gpu.helper = off`,
+        /// or it cannot run), no LINEAR/XR24 ring, a bad format or rate,
+        /// or too many captures. There is no CPU fallback.
+        Unsupported = 6,
+    }
+}
+
+/// One slot of a [`CaptureBuffers`](crate::msg::CaptureBuffers): where the
+/// image lives in that slot's dma-buf. The fd rides beside it.
+#[derive(Debug)]
+pub struct CaptureSlot {
+    /// The slot's dma-buf.
+    pub fd: std::os::fd::OwnedFd,
+    /// Byte offset of the image.
+    pub offset: u32,
+    /// Row pitch in bytes.
+    pub pitch: u32,
+    /// Size of the dma-buf in bytes (what to map).
+    pub size: u64,
+}
+
+impl PartialEq for CaptureSlot {
+    fn eq(&self, o: &Self) -> bool {
+        self.offset == o.offset && self.pitch == o.pitch && self.size == o.size
+    }
+}
+
 /// One cursor position: a byte offset into the text and the x it sits at.
 ///
 /// Reported by [`TextMeasured`](crate::msg::TextMeasured) so a text field
@@ -487,6 +542,16 @@ pub mod caps {
     /// downscale and whether the node fell off the planes for it. Local
     /// links only; must be listed in `ClientCaps`.
     pub const PLANE_HINT: u32 = 1 << 18;
+    /// Screen capture (#676): [`CaptureStart`](crate::msg::CaptureStart),
+    /// [`CaptureRelease`](crate::msg::CaptureRelease),
+    /// [`CaptureStop`](crate::msg::CaptureStop) and the server's
+    /// [`CaptureBuffers`](crate::msg::CaptureBuffers),
+    /// [`CaptureFrame`](crate::msg::CaptureFrame),
+    /// [`CaptureStopped`](crate::msg::CaptureStopped). Local links only
+    /// (the frames are dma-bufs); must be listed in `ClientCaps`. The bit
+    /// says the server *speaks* capture, not that this client may record:
+    /// a refused start is answered `CaptureStopped { Denied }`.
+    pub const CAPTURE: u32 = 1 << 19;
     /// Every bit from M5-A onwards: the range
     /// [`ClientCaps`](crate::msg::ClientCaps) governs.
     ///
@@ -505,7 +570,8 @@ pub mod caps {
         | OPAQUE_REGION
         | SURFACE
         | SHARE
-        | PLANE_HINT;
+        | PLANE_HINT
+        | CAPTURE;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -1044,7 +1110,8 @@ mod tests {
         assert_eq!(caps::SURFACE, 1 << 16);
         assert_eq!(caps::SHARE, 1 << 17);
         assert_eq!(caps::PLANE_HINT, 1 << 18);
-        assert_eq!(caps::CAPS_M5_MASK, 0x7ff00);
+        assert_eq!(caps::CAPTURE, 1 << 19);
+        assert_eq!(caps::CAPS_M5_MASK, 0xfff00);
         // Every M5 bit is in the mask, and nothing else is.
         for bit in [
             caps::POPUP,
@@ -1058,6 +1125,7 @@ mod tests {
             caps::SURFACE,
             caps::SHARE,
             caps::PLANE_HINT,
+            caps::CAPTURE,
         ] {
             assert_eq!(caps::CAPS_M5_MASK & bit, bit);
         }

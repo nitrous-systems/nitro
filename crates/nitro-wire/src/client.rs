@@ -311,6 +311,48 @@ impl Connection {
         self.send(&ClientMsg::AllocSurfaceBuffers(req))
     }
 
+    /// Start capturing output `output` (needs `caps::CAPTURE` listed in
+    /// `ClientCaps`; #676). Sent at once; answered with `CaptureBuffers`
+    /// then `CaptureFrame`s, or `CaptureStopped`.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn capture_start(
+        &mut self,
+        capture_id: u32,
+        output: u32,
+        max_fps: u32,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::CaptureStart(crate::msg::CaptureStart {
+            capture_id,
+            kind: crate::types::CaptureKind::Output,
+            output,
+            max_fps,
+            format: 0,
+        }))
+    }
+
+    /// Give capture slot `slot` back (needs `caps::CAPTURE`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn capture_release(&mut self, capture_id: u32, slot: u8) -> Result<(), Error> {
+        self.send(&ClientMsg::CaptureRelease(crate::msg::CaptureRelease {
+            capture_id,
+            slot,
+        }))
+    }
+
+    /// Stop a capture (needs `caps::CAPTURE`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn capture_stop(&mut self, capture_id: u32) -> Result<(), Error> {
+        self.send(&ClientMsg::CaptureStop(crate::msg::CaptureStop {
+            capture_id,
+        }))
+    }
+
     /// Bind a server-global hotkey (needs `caps::SHELL`).
     ///
     /// `mods` is a [`mod_mask`](crate::types::mod_mask) bitmask; `keysym` 0

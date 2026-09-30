@@ -466,3 +466,33 @@ mod tests {
         assert_eq!(out[0], ("frames", 42));
     }
 }
+
+/// Screen-recording counters (#676), for the `capture_*` lines of
+/// `stats`.
+#[derive(Debug)]
+pub struct CaptureStats {
+    /// `CaptureStart`s accepted.
+    pub started: u64,
+    /// `CaptureFrame`s sent.
+    pub frames: u64,
+    /// Frames wanted but not drawn: no free slot (the client held them
+    /// all), or the helper refused one.
+    pub drops: u64,
+    /// Submit-to-fence-signalled per frame, µs: the GPU time of a
+    /// capture composite plus the queueing ahead of it.
+    pub gpu_us: Window,
+    /// Paints held back because a capture frame still read the shadow.
+    pub raster_waits: u64,
+}
+
+impl Default for CaptureStats {
+    fn default() -> Self {
+        Self {
+            started: 0,
+            frames: 0,
+            drops: 0,
+            gpu_us: Window::new(PAINT_WINDOW),
+            raster_waits: 0,
+        }
+    }
+}

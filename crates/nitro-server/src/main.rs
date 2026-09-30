@@ -160,6 +160,8 @@ fn config_from_env() -> Result<Config, String> {
             .and_then(|v| nitro_server::config::GpuHelper::parse(&v)),
         gpu_helper: std::env::var_os("NITRO_GPU_HELPER").map(PathBuf::from),
         gpu_spawner: None,
+        // #676 B: the minimal recording gate until the prompt exists.
+        capture_allow: std::env::var("NITRO_CAPTURE_ALLOW").as_deref() == Ok("1"),
     })
 }
 

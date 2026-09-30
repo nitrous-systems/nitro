@@ -41,10 +41,10 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
-    CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
-    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
-    WindowRef,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureKind, CaptureSlot,
+    CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat,
+    DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest,
+    PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -2814,6 +2814,226 @@ fixed_msg! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Screen capture (#676, caps::CAPTURE)
+// ---------------------------------------------------------------------------
+
+fixed_msg! {
+    /// Start capturing an output (needs
+    /// [`caps::CAPTURE`](crate::types::caps::CAPTURE) listed in
+    /// `ClientCaps`; #676). Not buffered: answered at receipt with one
+    /// [`CaptureBuffers`] (the ring, a dma-buf per slot) and then a
+    /// [`CaptureFrame`] per captured frame, or with [`CaptureStopped`]
+    /// (`Denied`, `Locked`, `OutputGone`, `Unsupported`, …) — a refusal is
+    /// not a protocol error. `capture_id` is the client's; reusing a live
+    /// one is `Error { Protocol }`. `output` is an `OutputInfo` id.
+    /// `max_fps` caps the frame rate (0 = the output's rate); frames come
+    /// only after a flip that changed pixels. `format` is a DRM fourcc,
+    /// 0 for the server's choice; only `XR24` exists today.
+    CaptureStart {
+        /// The client's id for this capture.
+        capture_id: u32,
+        /// What is captured; only [`CaptureKind::Output`].
+        kind: CaptureKind,
+        /// The output (`OutputInfo.id`).
+        output: u32,
+        /// Frames per second at most; 0 = the output's refresh.
+        max_fps: u32,
+        /// DRM fourcc, 0 = server's choice (`XR24`).
+        format: u32,
+    }
+
+    /// Give a slot back (needs `caps::CAPTURE`): the client is done
+    /// reading the frame in it. Until then the server never draws into
+    /// that slot; with no slot free, frames are dropped, never waited for.
+    /// A release of a slot the client does not hold is ignored.
+    CaptureRelease {
+        /// The capture.
+        capture_id: u32,
+        /// The slot of a [`CaptureFrame`].
+        slot: u8,
+    }
+
+    /// Stop a capture (needs `caps::CAPTURE`). Answered with
+    /// [`CaptureStopped { Client }`](CaptureStopped). An unknown id is
+    /// ignored (it may have been stopped by the server meanwhile).
+    CaptureStop {
+        /// The capture.
+        capture_id: u32,
+    }
+
+    /// A capture ended or was refused (needs `caps::CAPTURE`). The id is
+    /// free again; the client closes its imports of the ring's dma-bufs,
+    /// which is what finally frees their memory.
+    CaptureStopped {
+        /// The capture.
+        capture_id: u32,
+        /// Why.
+        reason: CaptureStopReason,
+    }
+}
+
+/// Most slots a [`CaptureBuffers`] carries.
+pub const MAX_CAPTURE_SLOTS: usize = 4;
+
+/// The capture ring (needs [`caps::CAPTURE`](crate::types::caps::CAPTURE);
+/// carries one dma-buf fd per slot, at most [`MAX_CAPTURE_SLOTS`]; #676).
+/// Sent once, right after a granted [`CaptureStart`]. Every slot is
+/// `width × height` of `format` with `modifier` (LINEAR when the helper
+/// can, so a client may `mmap` a slot after its frame's fence). The client
+/// imports each slot once; frames then name a slot by index.
+#[derive(Debug, PartialEq)]
+pub struct CaptureBuffers {
+    /// The capture.
+    pub capture_id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// DRM fourcc (`XR24`).
+    pub format: u32,
+    /// DRM format modifier of every slot.
+    pub modifier: u64,
+    /// The slots, in index order.
+    pub slots: Vec<CaptureSlot>,
+}
+
+/// The fixed part of [`CaptureBuffers`]: 25 bytes.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CaptureBuffersFixed {
+    capture_id: <u32 as Plain>::Wire,
+    width: <u32 as Plain>::Wire,
+    height: <u32 as Plain>::Wire,
+    format: <u32 as Plain>::Wire,
+    modifier: <u64 as Plain>::Wire,
+    count: u8,
+}
+
+/// One slot's layout on the wire: 16 bytes.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CaptureSlotWire {
+    offset: <u32 as Plain>::Wire,
+    pitch: <u32 as Plain>::Wire,
+    size: <u64 as Plain>::Wire,
+}
+
+impl Body for CaptureBuffers {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        if self.slots.len() > MAX_CAPTURE_SLOTS {
+            return Err(EncodeError::TooManyFds);
+        }
+        w.put_struct(&CaptureBuffersFixed {
+            capture_id: Plain::to_wire(self.capture_id),
+            width: Plain::to_wire(self.width),
+            height: Plain::to_wire(self.height),
+            format: Plain::to_wire(self.format),
+            modifier: Plain::to_wire(self.modifier),
+            #[allow(clippy::cast_possible_truncation)] // checked above
+            count: self.slots.len() as u8,
+        });
+        for s in &self.slots {
+            w.put_struct(&CaptureSlotWire {
+                offset: Plain::to_wire(s.offset),
+                pitch: Plain::to_wire(s.pitch),
+                size: Plain::to_wire(s.size),
+            });
+        }
+        for s in &self.slots {
+            let dup = rustix::io::dup(s.fd.as_fd()).map_err(EncodeError::Fd)?;
+            w.put_fd(dup);
+        }
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<CaptureBuffersFixed>()?;
+        let n = usize::from(f.count);
+        if n > MAX_CAPTURE_SLOTS {
+            return Err(DecodeError::BadValue);
+        }
+        let mut layout = Vec::with_capacity(n);
+        for _ in 0..n {
+            let s = r.get_struct::<CaptureSlotWire>()?;
+            layout.push((
+                Plain::from_wire(s.offset)?,
+                Plain::from_wire(s.pitch)?,
+                Plain::from_wire(s.size)?,
+            ));
+        }
+        let mut slots = Vec::with_capacity(n);
+        for (offset, pitch, size) in layout {
+            slots.push(CaptureSlot {
+                fd: fds.take()?,
+                offset,
+                pitch,
+                size,
+            });
+        }
+        Ok(Self {
+            capture_id: Plain::from_wire(f.capture_id)?,
+            width: Plain::from_wire(f.width)?,
+            height: Plain::from_wire(f.height)?,
+            format: Plain::from_wire(f.format)?,
+            modifier: Plain::from_wire(f.modifier)?,
+            slots,
+        })
+    }
+}
+
+/// One captured frame (needs [`caps::CAPTURE`](crate::types::caps::CAPTURE);
+/// carries one fd, the frame's completion `sync_file`; #676). The slot is
+/// the client's from now until its [`CaptureRelease`]; its pixels are
+/// complete once `fence` polls readable. `damage` is the union of what
+/// changed since the client's previous frame, in output pixels (the first
+/// frame damages everything). `time_ns` is the `CLOCK_MONOTONIC` time of
+/// the flip the frame follows.
+#[derive(Debug)]
+pub struct CaptureFrame {
+    /// The capture.
+    pub capture_id: u32,
+    /// The slot drawn into.
+    pub slot: u8,
+    /// Flip time, `CLOCK_MONOTONIC` ns.
+    pub time_ns: u64,
+    /// Changed rects since the previous frame, output pixels.
+    pub damage: Vec<IRect>,
+    /// Completion fence (`sync_file`).
+    pub fence: OwnedFd,
+}
+
+impl PartialEq for CaptureFrame {
+    fn eq(&self, o: &Self) -> bool {
+        self.capture_id == o.capture_id
+            && self.slot == o.slot
+            && self.time_ns == o.time_ns
+            && self.damage == o.damage
+    }
+}
+
+impl Body for CaptureFrame {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put(self.capture_id);
+        w.put_u8(self.slot);
+        w.put(self.time_ns);
+        w.put_vec(&self.damage);
+        let dup = rustix::io::dup(self.fence.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            capture_id: r.get()?,
+            slot: r.get_u8()?,
+            time_ns: r.get()?,
+            damage: r.get_vec()?,
+            fence: fds.take()?,
+        })
+    }
+}
+
 msg_enum! {
     /// Everything a client may send.
     ClientMsg {
@@ -2929,6 +3149,13 @@ msg_enum! {
         /// `PresentSurface` with an acquire fence (needs `caps::DMABUF`;
         /// carries one fd).
         PresentSurfaceFenced = 0x0314,
+        /// Start capturing an output; answered at receipt (needs
+        /// `caps::CAPTURE`).
+        CaptureStart = 0x0315,
+        /// Give a capture slot back (needs `caps::CAPTURE`).
+        CaptureRelease = 0x0316,
+        /// Stop a capture (needs `caps::CAPTURE`).
+        CaptureStop = 0x0317,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -3607,6 +3834,13 @@ msg_enum! {
         DmabufFeedback = 0x830b,
         /// A surface's plane-fit hint (needs `caps::PLANE_HINT`).
         SurfacePlaneHint = 0x830c,
+        /// A capture's ring (needs `caps::CAPTURE`; carries one fd per
+        /// slot).
+        CaptureBuffers = 0x830d,
+        /// One captured frame (needs `caps::CAPTURE`; carries one fd).
+        CaptureFrame = 0x830e,
+        /// A capture ended or was refused (needs `caps::CAPTURE`).
+        CaptureStopped = 0x830f,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

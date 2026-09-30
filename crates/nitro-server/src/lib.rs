@@ -36,6 +36,7 @@
 //! Drop order on shutdown is clients → sockets → input → backend → DRM
 //! device → seat; the `Server` fields are declared in exactly that order.
 
+pub mod capture;
 pub mod clients;
 pub mod config;
 pub mod control;
@@ -281,6 +282,9 @@ pub struct Config {
     /// Tests: run the helper in-process on the socket end this is handed,
     /// instead of `exec`ing a binary.
     pub gpu_spawner: Option<gpu::Spawner>,
+    /// Let every local client record the screen (#676 B's minimal gate,
+    /// `NITRO_CAPTURE_ALLOW=1`); off, every `CaptureStart` is `Denied`.
+    pub capture_allow: bool,
 }
 
 impl Config {
@@ -328,6 +332,7 @@ impl Config {
             gpu: Some(config::GpuHelper::Off),
             gpu_helper: None,
             gpu_spawner: None,
+            capture_allow: false,
         }
     }
 }
@@ -1236,6 +1241,10 @@ struct Server {
     plan: PlanScratch,
     /// Shots waiting for the GPU helper, and their counters (#3962).
     shots: shot::Shots,
+    /// Screen recordings (#676).
+    captures: capture::Captures,
+    /// [`Config::capture_allow`].
+    capture_allow: bool,
 }
 
 /// Reusable buffers for the per-frame plane plan and helper frame.
@@ -1586,6 +1595,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         paint_items: Vec::new(),
         plan: PlanScratch::default(),
         shots: shot::Shots::default(),
+        captures: capture::Captures::default(),
+        capture_allow: config.capture_allow,
     };
     server.register_backend()?;
     // The deferral timer stays in the epoll set for the whole run. It is
@@ -2094,6 +2105,7 @@ impl Server {
         // (#3918). Per-node feedback follows from `send_surface_hints`.
         self.send_default_feedback(None);
         self.feedback.invalidate();
+        self.captures_outputs_changed();
     }
 
     /// Give every connected output its scale, its device rect and its
@@ -2572,6 +2584,12 @@ impl Server {
         if !self.outputs[index].needs_paint() {
             return false;
         }
+        // The shadow hazard (#676): a recording frame still reads this
+        // output's shadow. Keep the damage; its fence brings the paint back.
+        if self.outputs[index].needs_raster() && self.capture_reading(id) {
+            self.captures.stats.raster_waits += 1;
+            return false;
+        }
         // Which Surfaces go on planes this frame (#3899), before anything
         // is rasterized: a switch invalidates the output.
         self.plan_planes(index);
@@ -2653,6 +2671,9 @@ impl Server {
                 split = (painted.raster_px, painted.moved_px, painted.blitted);
                 shadow.note_painted(&rasterize);
                 let copy_us = frame::copy_region(shadow, &mut buf, &region);
+                if !self.captures.is_empty() {
+                    self.capture_damage(id, &rasterize);
+                }
                 (paint_us, copy_us)
             } else {
                 let (width, height, stride) = (buf.width, buf.height, buf.stride);
@@ -3400,6 +3421,9 @@ impl Server {
             self.send_buffer_releases();
         }
         self.paint_or_defer();
+        // Recording (#676): what this output shows now, after its paint so
+        // the next raster is a vblank away from the capture's fence.
+        self.captures_on_flip(id);
         // A commit stamped while this flip was in flight (#646) is in
         // `painting`; if nothing is left to paint, no frame will carry it.
         self.answer_idle_clients();
@@ -6958,6 +6982,7 @@ impl Server {
         self.planes_stats(pairs);
         self.gpu_stats(pairs);
         self.shot_stats(pairs);
+        self.capture_stats(pairs);
         pairs.push(("dmabuf_placeholder_paints", frame::placeholder_paints()));
         pairs.push(("fences_pending", self.fences.len() as u64));
         pairs.push(("fence_waits", self.fence_waits));
@@ -7677,6 +7702,18 @@ impl Server {
             ClientMsg::ExportSurface(m) => {
                 self.share_allowed(token, "ExportSurface") && self.export_surface(token, m.id)
             }
+            // Screen capture (#676): answered at receipt; a refusal is a
+            // `CaptureStopped`, not an error.
+            ClientMsg::CaptureStart(m) => {
+                self.capture_allowed(token, "CaptureStart") && self.capture_start(token, &m)
+            }
+            ClientMsg::CaptureRelease(m) => {
+                self.capture_allowed(token, "CaptureRelease") && self.capture_release(token, m)
+            }
+            ClientMsg::CaptureStop(m) => {
+                self.capture_allowed(token, "CaptureStop")
+                    && self.capture_stop_request(token, m.capture_id)
+            }
             ClientMsg::ImportSurface(m) => {
                 self.share_allowed(token, "ImportSurface")
                     && self.import_surface(token, m.token, m.id)
@@ -7813,7 +7850,8 @@ impl Server {
                 | nitro_wire::types::caps::SURFACE
                 | nitro_wire::types::caps::DMABUF
                 | nitro_wire::types::caps::SHARE
-                | nitro_wire::types::caps::PLANE_HINT;
+                | nitro_wire::types::caps::PLANE_HINT
+                | nitro_wire::types::caps::CAPTURE;
             if self
                 .outputs
                 .iter()
@@ -9036,6 +9074,7 @@ impl Server {
         if self.hotkey_pending.is_some_and(|(t, _)| t == token) {
             self.hotkey_pending = None;
         }
+        self.capture_client_gone(token);
         let Some(mut client) = self.wire_clients.remove(&token) else {
             return;
         };
@@ -12731,6 +12770,7 @@ impl Server {
         match r {
             gpu::Reply::Ready => {
                 self.shots_on_ready();
+                self.captures_on_ready();
                 // Outputs with helper-able Surfaces decide again.
                 for o in &mut self.outputs {
                     if !o.gpu_layers.is_empty() {
@@ -12750,7 +12790,22 @@ impl Server {
             gpu::Reply::ShadowRefused => {
                 warn!("gpu helper: shadow import refused; mode 2 off for this output");
             }
+            gpu::Reply::CaptureRing {
+                ring_id,
+                size,
+                fourcc,
+                modifier,
+                slots,
+            } => self.capture_ring(ring_id, size, (fourcc, modifier), slots),
+            gpu::Reply::CaptureRingFailed { ring_id } => self.capture_ring_failed(ring_id),
+            gpu::Reply::CaptureCompositeFailed { serial, code } => {
+                self.capture_frame_failed(serial, code);
+            }
             gpu::Reply::Composited { serial, fence } => {
+                // A recording frame (#676) first: it is not the ring's.
+                let Some(fence) = self.capture_composited(serial, fence) else {
+                    return;
+                };
                 let poll = EpollPoll(&self.epoll);
                 let Some(f) = self
                     .gpu
@@ -12875,7 +12930,14 @@ impl Server {
     /// The helper's timer: a restart is due, or it is not answering.
     fn on_gpu_timer(&mut self) {
         let overdue = self.gpu.capture_overdue(Instant::now());
+        let due = self.gpu.capture_due.is_some_and(|t| t <= Instant::now());
+        if due {
+            self.gpu.capture_due = None;
+        }
         let (respawn, hung) = self.gpu.on_timer();
+        if due && !hung {
+            self.captures_on_timer();
+        }
         if hung && overdue {
             self.shots_fail_all(protocol::ShotReason::HelperTimeout);
         }
@@ -12902,6 +12964,7 @@ impl Server {
     /// borrowed may go back.
     fn on_gpu_fence(&mut self, serial: u64) {
         self.gpu.fence_signalled(&EpollPoll(&self.epoll), serial);
+        self.capture_fence(serial);
         self.send_gpu_releases();
         // A slot may be usable again for damage that waited for one.
         self.settle();
@@ -12933,6 +12996,7 @@ impl Server {
     /// schedule a restart.
     fn gpu_lost(&mut self) {
         self.shots_fail_all(protocol::ShotReason::HelperUnavailable);
+        self.captures_stop_all(nitro_wire::types::CaptureStopReason::HelperLost);
         let idle = self.gpu.idle();
         self.gpu_drop_owner(true, true);
         self.gpu.died(idle);
@@ -12989,6 +13053,7 @@ impl Server {
     /// VT switch away: stop the helper and drop what it held.
     fn gpu_pause(&mut self) {
         self.shots_fail_all(protocol::ShotReason::HelperUnavailable);
+        self.captures_pause();
         self.gpu_drop_owner(false, true);
         self.gpu.stop(&EpollPoll(&self.epoll), TOK_GPU);
         self.send_gpu_releases();
@@ -13410,6 +13475,10 @@ impl Server {
             shadow.note_painted(&rasterize);
             Some(p)
         };
+        if !self.captures.is_empty() {
+            let id = self.outputs[index].kms_id;
+            self.capture_damage(id, &rasterize);
+        }
         self.text.next_frame();
         if std::mem::take(&mut self.gpu_reshadow) {
             self.gpu_reimport_shadow(index);
