@@ -1,0 +1,26 @@
+[package]
+name = "nitro-auth"
+description = "The lock screen's PAM helper: authenticates the session's own user, speaking greetd's IPC on stdin/stdout"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The wire, shared with nitro-greeter.
+nitro-login = { workspace = true }
+# PAM: the tree's second deliberate C dependency, and this is the only
+# crate that links it. The FFI `unsafe` lives inside the binding
+# (`libpam-sys`), the xkbcommon precedent; none is ours. DEPENDENCIES.md.
+nonstick = { workspace = true }
+
+[lib]
+name = "nitro_auth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-auth"
+path = "src/main.rs"

@@ -19,6 +19,7 @@ number we watch.
 | `vte` | term | The VT/ANSI escape-sequence **state machine** (Paul Williams' DEC parser), which is a table of transitions nobody should transcribe twice: C0, CSI with its parameters and intermediates, OSC with both terminators, DCS, and UTF-8 decode across buffer boundaries. Crucially it assigns **no meaning** — it hands back `print`/`execute`/`csi_dispatch`/`osc_dispatch` and every escape sequence's *effect* is ours, in `nitro-term`'s own `vt.rs`, where it is tested. No `serde`, no allocator tricks, `default-features = false`. | **+2 crates** (`arrayvec`, `memchr`); `memchr` was already in the tree via nothing else, so it is genuinely two. The alternative is roughly 600 lines of state table and the bugs that come with hand-rolling one — and the failure mode of a wrong transition is a terminal that garbles output on a rare sequence, months later. |
 | `swash` | text | OpenType shaping, scaling and hinted glyph rasterization in one pure-Rust crate. Text is the one part of a display server nobody should write twice: the shaper alone is the OpenType GSUB/GPOS state machines, script itemization and mark attachment. Clients never see any of it — the server shapes, so the wire carries strings. | **+7 net crates** (`swash`, `skrifa`, `read-fonts`, `font-types`, `yazi`, `zeno`, `once_cell`); the other five of its seventeen (`bytemuck`, `syn`, `proc-macro2`, `quote`, `unicode-ident`) are already in our tree. **The one place untrusted bytes are parsed by a dependency** — see below. |
 | `ash` (+ `libloading`, `cfg-if`) | gpu-vulkan | Vulkan bindings for the GPU helper (#3920), the only crate that talks to a GPU API. `default-features = false, features = ["loaded", "std"]`: libvulkan is **dlopen'd** (`libloading`), so nothing links against it and a box without Vulkan still builds and runs everything else; the `debug` feature (Debug impls on every Vulkan struct) is off for size. Rejected: `wgpu` (dozens of crates, its own shader translator), `vulkano` (proc-macros, much larger), GLES/EGL (41–67 MB RSS against 8–11 MB measured in #3903). | **+3 external names** (`ash`, `libloading`, `cfg-if`; `windows-link` is Windows-only and not built). `cargo tree` 90 → 96 lines, 37 → 40 names. Linked only into `nitro-gpu-vulkan` (582 928 bytes stripped); every other binary is byte-identical. The FFI `unsafe` is ours — see exception Five. |
+| `nonstick` (+ `libpam-sys`, `libpam-sys-impls`, `libpam-sys-helpers`) | auth | PAM, for the lock screen's helper `nitro-auth` (#3949): the tree's **second deliberate C dependency** after libseat, approved as such (`docs/greeter.md`, decision 6). `nitro-auth` is the **only** binary that links libpam: `nitro-greeter` talks to it over pipes through `nitro-login`'s codec, and `ldd nitro-greeter` shows no libpam. `default-features = false, features = ["link"]`: no bindgen, no system headers at build time, just `-lpam`. A message-level API (`Conversation::communicate` over `Exchange::{Prompt, MaskedPrompt, Info, Error, …}`) that maps one-to-one onto greetd's `auth_message` kinds. The FFI `unsafe` (the conversation callback, `pam_start`/`pam_end`) is **inside the binding**; `nitro-auth` has none (the `xkbcommon` precedent). Compared: `pam-client2` 0.5 is also +4 (`pam-client2`, `pam-sys2`, the `rustversion` proc-macro, `serde_core` through its `bitflags` feature) and MPL-2.0; `pam` 0.8 / `pam-sys` 1.0-alpha is ~20 (bindgen, clang-sys, nom, regex, syn 1 and 2). Piping to `unix_chkpwd` needs no library but supports passwords only, which is the opposite of decision 4 (render whatever the PAM stack asks: TOTP, fingerprint, faillock messages). | **+4 external names** (`bitflags` and `libc` already in the tree). `cargo tree -e normal` **96 → 106** lines (the four crates plus `nitro-login`, `nitro-auth`, `nitro-greeter` and `(*)` markers), **40 → 44** distinct external names. `nitro-auth` is 359 896 bytes stripped. Limitation: nonstick 0.1 has no `pam_setcred` for applications, so an unlock does not refresh credentials (Kerberos tickets); acceptable for a lock screen, recorded in `crates/nitro-auth/README.md`. Build requirement: libpam's development package (`docs/install.md`). |
 
 ### Why `vte`, and where the line is drawn
 
@@ -268,6 +269,17 @@ whenever nobody is dragging the volume slider. `nitro-settings` is
 The whole-workspace figure is **74** lines and **37 distinct external
 crate names** with M4-C in — both unchanged from M4-A, which is the
 number this section exists to report.
+
+The lock screen's other two crates add **zero** external names.
+`nitro-login` (greetd's IPC codec and `owner()`) is `std` and `rustix`
+(`process`, for `getuid`): seven flat JSON messages are not worth `serde`
+(`docs/greeter.md`, decision 3), and it exists as its own crate so that
+`nitro-greeter` can speak to `nitro-auth` without linking libpam.
+`nitro-greeter` is `nitro-ui`, `nitro-login`, `nitro-system` (the logout
+button's `session.sock`), `rustix`, and `nitro-bar` for its clock
+(`clock::{Zone, format_hm, ms_to_next_minute}`): reuse of a workspace
+crate, the files → launcher precedent, not a dependency in the sense this
+file counts.
 
 ## Vendored assets
 
@@ -766,9 +778,15 @@ Tested headless on both boxes by readback (`tests/pixels.rs`,
 `just box-gpu-test`).
 
 The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
-`input-sys`, `xkbcommon`) contain their own, which is exactly why each is
+`input-sys`, `xkbcommon`, and `nonstick`/`libpam-sys` for PAM since
+#3949) contain their own, which is exactly why each is
 listed here: it buys a kernel or C ABI we would otherwise have to write
 `unsafe` ourselves to reach.
+
+The lock screen (#3949) adds **no** exception of ours: `nitro-auth`
+calls PAM only through `nonstick`'s safe API, and `nitro-login`'s buffer
+wiping uses `black_box` rather than `write_volatile`, as the secret
+`TextField` does. The count above stays at five.
 
 A deliberate *non*-use is worth recording, and it cost a **binary**
 dependency rather than a crate. A terminal's child needs its own session

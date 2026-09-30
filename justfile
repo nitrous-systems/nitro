@@ -65,7 +65,7 @@ asroot_for() {
 # launcher lists nitro-demo only when it is present, so leaving it out
 # costs nothing. nitro-session finds the rest next to itself in $BINDIR
 # (crates/nitro-session/src/pieces.rs), so they are installed as one set.
-install_bins := "nitro-server nitro-session nitro-shot nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings nitro-video hey"
+install_bins := "nitro-server nitro-session nitro-shot nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings nitro-video nitro-greeter nitro-auth hey"
 
 # Chromium on nitro (#3865). A **release, non-component** build of the
 # `nitro-ozone` branch in the Chromium checkout. Neither install-chromium
@@ -103,6 +103,15 @@ install-bins:
     for b in {{install_bins}}; do
         "${SU[@]}" install -Dm755 "target/release/$b" '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
+    # The lock screen's PAM service (deploy/pam.d/nitro-lock). An existing
+    # one is the admin's and is left alone.
+    pam='{{DESTDIR}}{{SYSCONFDIR}}/pam.d/nitro-lock'
+    if [[ -e $pam ]]; then
+        echo "install-bins: keeping existing $pam"
+    else
+        asroot_for '{{DESTDIR}}{{SYSCONFDIR}}'
+        "${SU[@]}" install -Dm644 deploy/pam.d/nitro-lock "$pam"
+    fi
 
 # deploy/*.desktop → $DESTDIR$DATADIR/applications/.
 #
@@ -220,6 +229,7 @@ uninstall:
     for b in {{install_bins}} chromium-nitro; do
         "${su_bin[@]}" rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
+    asroot_for '{{DESTDIR}}{{SYSCONFDIR}}'; "${SU[@]}" rm -f '{{DESTDIR}}{{SYSCONFDIR}}/pam.d/nitro-lock'
     for f in deploy/*.desktop deploy/nitro-mimeapps.list deploy/chromium/chromium-nitro.desktop; do
         "${su_data[@]}" rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done

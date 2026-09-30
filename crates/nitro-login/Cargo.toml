@@ -1,0 +1,17 @@
+[package]
+name = "nitro-login"
+description = "The login wire: greetd's IPC codec (length-prefixed flat JSON), shared by nitro-auth and nitro-greeter"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# std, and `rustix` for `getuid` (the owner's `/etc/passwd` entry). No JSON
+# crate: seven flat messages are not worth `serde` (docs/greeter.md,
+# decision 3). And no PAM: this crate is what lets `nitro-greeter` speak to
+# `nitro-auth` without linking libpam itself.
+rustix = { workspace = true, features = ["process"] }

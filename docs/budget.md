@@ -1922,6 +1922,9 @@ fenced frames. Idle `nitro-server` on box1: 18.8 MB RSS, 10.4 MB anon,
 
 ## Dependency count
 
+Latest: **106** lines and **44** distinct external names with the lock
+screen (#3949: `nonstick` and three `libpam-sys*` crates, from 96 / 40).
+
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
 (70 at M3, 60 at M2, 48 at M1), matching `DEPENDENCIES.md`. It is **89**
 at the footprint baseline (`13f69e2`, above). The milestone figures here

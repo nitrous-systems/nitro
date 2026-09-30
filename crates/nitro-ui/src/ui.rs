@@ -3991,6 +3991,37 @@ impl<S: 'static> Ui<S> {
         ))
     }
 
+    /// Lock the session, or take over a lock nobody holds (shell only).
+    ///
+    /// From now on this connection is the **lock owner**: only its
+    /// windows are drawn and receive input, and the server gives the
+    /// keyboard to its window if it has one. A lock whose owner
+    /// disconnected (a crashed lock screen, or a server started with
+    /// `NITRO_LOCKED=1`) is taken over. Sent at once, without a commit.
+    /// Fatal if another live connection owns the lock. See
+    /// `docs/shell.md`, "The session lock".
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn lock_session(&mut self) -> Result<(), Error> {
+        self.wire
+            .send_now(&nitro_wire::msg::ClientMsg::Lock(nitro_wire::msg::Lock))
+    }
+
+    /// Unlock the session: the lock owner's decision, after it
+    /// authenticated the user (shell only).
+    ///
+    /// Fatal from anyone but the owner, including when the session is
+    /// not locked. Sent at once, without a commit. See
+    /// [`Ui::lock_session`].
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn unlock_session(&mut self) -> Result<(), Error> {
+        self.wire
+            .send_now(&nitro_wire::msg::ClientMsg::Unlock(nitro_wire::msg::Unlock))
+    }
+
     /// Release a hotkey binding. Unbinding an id that is not bound is a
     /// deliberate no-op: a shell shutting down should not have to
     /// remember what it managed to bind.

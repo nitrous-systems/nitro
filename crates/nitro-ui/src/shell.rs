@@ -211,6 +211,20 @@ impl Surface {
         }
     }
 
+    /// A lock screen: `Overlay`, undecorated, covering the output,
+    /// reserving nothing, and **focusable**, unlike every other shell
+    /// surface: it is the one window that must read the keyboard. Pair
+    /// it with [`Ui::lock_session`](crate::Ui::lock_session).
+    #[must_use]
+    pub const fn lock() -> Self {
+        Self {
+            layer: Layer::Overlay,
+            flags: window_flags::UNDECORATED,
+            anchor: Some(Anchor::fill()),
+            zone: None,
+        }
+    }
+
     /// Replace the anchor.
     #[must_use]
     pub const fn anchored(mut self, anchor: Anchor) -> Self {
@@ -322,6 +336,21 @@ mod tests {
         assert_eq!(Surface::wallpaper().zone, None);
         assert_eq!(Surface::wallpaper().layer, Layer::Background);
         assert_eq!(Surface::overlay().layer, Layer::Overlay);
+    }
+
+    #[test]
+    fn a_lock_surface_covers_the_output_and_takes_the_keyboard() {
+        // The one shell surface that must be focusable: it reads a
+        // password.
+        let s = Surface::lock();
+        assert_eq!(s.flags & window_flags::NO_FOCUS, 0);
+        assert_eq!(
+            s.flags & window_flags::UNDECORATED,
+            window_flags::UNDECORATED
+        );
+        assert_eq!(s.layer, Layer::Overlay);
+        assert_eq!(s.anchor, Some(Anchor::fill()));
+        assert_eq!(s.zone, None);
     }
 
     #[test]

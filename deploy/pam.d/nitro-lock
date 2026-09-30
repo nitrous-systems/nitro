@@ -1,0 +1,8 @@
+# PAM service for nitro-auth, the lock screen's helper (nitro-greeter --lock).
+# Installed to /etc/pam.d/nitro-lock by `just install` (never overwriting an
+# existing one). Same shape as swaylock's: authenticate and check the account
+# the way a console login does, so fingerprint, TOTP or faillock lines in the
+# `login` stack apply here too. No session or password stack: unlocking opens
+# no session and changes no password.
+auth      include   login
+account   include   login

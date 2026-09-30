@@ -31,6 +31,7 @@ nitro-kms    = { path = "crates/nitro-kms" }
 nitro-shm    = { path = "crates/nitro-shm" }
 nitro-fs     = { path = "crates/nitro-fs" }
 nitro-gpu    = { path = "crates/nitro-gpu" }
+nitro-login  = { path = "crates/nitro-login" }
 rustix       = { version = "1", default-features = false, features = ["std"] }
 drm          = "0.15"
 libseat      = { version = "0.2", default-features = false }
@@ -40,6 +41,9 @@ xkbcommon    = "0.9"
 zerocopy     = { version = "0.8", features = ["derive"] }
 swash        = "0.2"
 zeno         = "0.3"
+# PAM for `nitro-auth` only, the one binary that links libpam (#3949):
+# `link` without the default extras; no bindgen, no system headers at build.
+nonstick     = { version = "0.1", default-features = false, features = ["link"] }
 vte          = { version = "0.15", default-features = false, features = ["std"] }
 # Vulkan for the GPU helper only (`nitro-gpu-vulkan`): dlopen'd libvulkan
 # (`loaded`), no Debug impls (`debug` off) to keep the binary small.

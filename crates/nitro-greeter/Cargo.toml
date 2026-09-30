@@ -1,0 +1,33 @@
+[package]
+name = "nitro-greeter"
+description = "The lock screen (and, later, greetd greeter): renders PAM's conversation as a nitro-ui app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-ui = { workspace = true }
+# The wire both backends speak. Not `nitro-auth`: that would put `-lpam`
+# on this binary's link line, and the helper must be the only one.
+nitro-login = { workspace = true }
+# `session.sock`, for the logout path.
+nitro-system = { workspace = true }
+# The clock: `Zone`, `format_hm`, `ms_to_next_minute`. Reuse of a
+# workspace crate, not a new dependency (the files → launcher precedent).
+nitro-bar = { workspace = true }
+rustix = { workspace = true, features = ["fs", "time"] }
+
+[lib]
+name = "nitro_greeter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-greeter"
+path = "src/main.rs"
+
+[dev-dependencies]
+nitro-ui = { workspace = true, features = ["test-support"] }

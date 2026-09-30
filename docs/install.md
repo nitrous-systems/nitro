@@ -33,7 +33,7 @@ updates the files in place.
 | `BINDIR` | `$PREFIX/bin` | |
 | `LIBDIR` | `$PREFIX/lib` | Chromium goes to `$LIBDIR/nitro/chromium` |
 | `DATADIR` | `$PREFIX/share` | |
-| `SYSCONFDIR` | `/etc` if `PREFIX=/usr`, else `$PREFIX/etc` | only for `install-apparmor` |
+| `SYSCONFDIR` | `/etc` if `PREFIX=/usr`, else `$PREFIX/etc` | `install-apparmor`, and `pam.d/nitro-lock` from `install-bins` |
 | `SUDO` | `auto` | privilege prefix for writes: `auto`, `sudo`, `doas`, or `none` |
 
 
@@ -46,7 +46,7 @@ the shell does not expand `~`.
 | recipe | installs |
 |---|---|
 | `install` | `install-bins` then `install-desktop` |
-| `install-bins` | `cargo build --release`, then the shipped binaries into `$BINDIR` |
+| `install-bins` | `cargo build --release`, then the shipped binaries into `$BINDIR`, and `deploy/pam.d/nitro-lock` into `$SYSCONFDIR/pam.d` unless one exists |
 | `install-desktop` | `deploy/*.desktop` and `deploy/nitro-mimeapps.list` into `$DATADIR/applications` |
 | `install-chromium` | optional, see below |
 | `install-apparmor` | optional, see below |
@@ -54,7 +54,8 @@ the shell does not expand `~`.
 
 **Binaries:** nitro-server, nitro-session, nitro-shot, nitro-calc,
 nitro-amp, nitro-term, nitro-files, nitro-bar, nitro-launcher,
-nitro-wallpaper, nitro-settings, hey. The test box also gets nitro-demo,
+nitro-wallpaper, nitro-settings, nitro-video, nitro-greeter, nitro-auth,
+hey. The test box also gets nitro-demo,
 nitro-bench and the examples. Those are development and measurement
 tools and are not installed.
 
@@ -71,6 +72,15 @@ launching from the launcher. The long comment on `deploy-bins`
 and video handlers under `XDG_CURRENT_DESKTOP=nitro` (which nitro-session
 sets for its children). It ranks below a user's `~/.config/mimeapps.list`,
 which the install never touches (`docs/files.md`).
+
+**The lock screen needs PAM.** `nitro-auth` (the lock screen's helper,
+run by `nitro-greeter --lock`) links libpam, so the build needs its
+development package: `libpam0g-dev` on Debian/Ubuntu, `pam-devel` on
+Fedora, `pam` on Arch. It is the only binary that links it. At run time it
+uses the PAM service `nitro-lock`; `install-bins` installs
+`deploy/pam.d/nitro-lock` (`auth`/`account include login`) and never
+overwrites an existing file, so an admin's edit survives a re-install.
+`uninstall` removes it.
 
 ## Starting the session
 

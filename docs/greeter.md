@@ -1,8 +1,8 @@
 # Login: greetd + `nitro-greeter`
 
-Status: **sketch**. Nothing here is implemented. It argues where the line
-goes, what the new pieces are, and what each one costs, so the first
-commit can be small.
+Status: **in progress**. Steps 1–3 of the plan below are built. The page
+argues where the line goes, what the new pieces are, and what each one
+costs, so each commit can be small.
 
 Today the desktop starts from `deploy/nitro-dev.service`: a systemd unit
 with `User=kaspar` and `PAMName=login` that puts `nitro-session` on tty2.
@@ -244,7 +244,10 @@ table is easy to get wrong in ways that surface months later. This is
 the opposite case: a closed set of seven flat messages, each testable
 exhaustively.
 
-So `nitro-greeter/src/greetd.rs`:
+So the codec (built in step 3, in the small crate `crates/nitro-login`,
+`src/ipc.rs`, rather than in `nitro-greeter/src/greetd.rs`: `nitro-auth`
+speaks the same protocol on its stdio, and a shared crate is what keeps
+libpam off the greeter's link line):
 
 - **Encode**: `format!` over a string escaper for `"`, `\`, control
   characters as `\u00XX`. The only untrusted input going out is the
@@ -386,9 +389,9 @@ torn down, so the common path has no handover at all.
   `nitro-auth`, a small helper that runs PAM for the session's own user
   and speaks the same prompt and answer messages. It is the only binary
   that links libpam: our second deliberate C dependency, with the FFI
-  `unsafe` inside the binding crate (the `xkbcommon` precedent). Which
-  crate is still to be measured. Piping to `unix_chkpwd` needs no
-  library, but supports passwords only.
+  `unsafe` inside the binding crate (the `xkbcommon` precedent). The
+  crate is `nonstick` (measured in step 3; `DEPENDENCIES.md`). Piping to
+  `unix_chkpwd` needs no library, but supports passwords only.
 - **The lock is the server's, from the first frame.** A lock client
   started after the desktop would race it. The server starts locked,
   composites only the lock surface (other windows are not drawn at all,
@@ -445,10 +448,21 @@ In order. Each step can land on its own:
    which is the same boundary the shell socket already has (`docs/shell.md`,
    "What this model is worth"). `nitro-session --locked` starts the lock
    screen first, so in practice it is the first to ask.
-3. **`nitro-auth` and the conversation**: the helper, and in
-   `nitro-greeter` the pure state machine (tested against scripted
-   conversations: password; one-time code after password; an info line;
-   a wrong password) with the lock-screen UI on top.
+3. **`nitro-auth` and the conversation**: done. `crates/nitro-login`
+   is greetd's codec (decision 3) and `owner()`, shared by both ends.
+   `nitro-auth` speaks **greetd's protocol verbatim** on stdin/stdout,
+   authenticates only the session's owner through PAM service
+   `nitro-lock` (`deploy/pam.d/nitro-lock`), and is the only binary
+   linking libpam, through `nonstick` (no `unsafe` of ours). In
+   `nitro-greeter`, `src/conv.rs` is the pure state machine, tested
+   against scripted conversations (password; one-time code after
+   password; an info line; a wrong password and its retry; a cancel),
+   and `src/backend.rs` the `Backend` trait with `AuthHelper`; greetd
+   will be the second `Backend`. `nitro-greeter --lock` is the lock
+   screen: `Surface::lock()`, `Ui::lock_session` on start (taking over an
+   ownerless lock), `Ui::unlock_session` and exit 0 on success. Another
+   user's name starts no conversation and offers logout. No
+   `pam_setcred` yet (the binding lacks it).
 4. **`nitro-session --locked`** and the greetd config. On the box,
    measure boot to the lock screen's first frame (`first_frame_ms`) and
    unlock to desktop.
@@ -460,4 +474,6 @@ In order. Each step can land on its own:
    and a `DEPENDENCIES.md` note that greetd is a runtime requirement of
    the login path, not a crate.
 
-The crate count moves once, for the PAM binding in step 3.
+The crate count moves once, for the PAM binding in step 3: `cargo tree
+-e normal` 96 → 106 lines, 40 → 44 distinct external names (`nonstick`,
+`libpam-sys`, `libpam-sys-impls`, `libpam-sys-helpers`).
