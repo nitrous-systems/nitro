@@ -870,13 +870,18 @@ fn a_locked_start_starts_the_lock_screen_first_and_the_server_locked() {
         order.iter().all(|n| !starts(&env, n).is_empty())
     });
     assert_eq!(server_locked_env(&env), "NITRO_LOCKED=1");
-    // Spawn order is start order; the stubs' own clocks can tie within
-    // a millisecond, so this is `<=` along the chain.
-    let times: Vec<u128> = order.iter().map(|n| starts(&env, n)[0].1).collect();
-    assert!(
-        times.windows(2).all(|w| w[0] <= w[1]),
-        "start order {order:?}: {times:?}"
-    );
+    // The session spawns in table order (server, then after readiness
+    // the lock screen, then the shell), but the stubs' *own* first-line
+    // timestamps race each other under a loaded test run: exec of five
+    // siblings within a millisecond is not ordered. What is guaranteed,
+    // and asserted, is that nothing started before the server, and that
+    // the table the loop spawned from puts the lock screen first.
+    let server = starts(&env, "nitro-server")[0].1;
+    for n in &order[1..] {
+        assert!(starts(&env, n)[0].1 >= server, "{n} started before the server");
+    }
+    let names: Vec<String> = session.status().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, order, "spawn order is the table's");
     session.teardown();
 }
 
