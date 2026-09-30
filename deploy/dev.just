@@ -288,8 +288,8 @@ chromium-clipboard:
     ssh {{box}} 'bash ~/nitro-stage/chromium-clipboard.sh'
 
 # Chromium drag and drop end to end on the box (#3965): two tiled browsers
-# drag text and links to each other and to themselves; drops on nitro-term
-# and the bar, Escape and a source SIGKILLed mid-drag must end cleanly.
+# drag text and links to each other, to themselves and onto nitro-term;
+# drops on the bar, Escape and a source SIGKILLed mid-drag must end cleanly.
 # Prints PASS/FAIL per check (see the script). Needs `deploy-chromium` and a
 # logged-in session; `KEEP=1` on the box keeps the logs.
 [doc("Chromium drag-and-drop end-to-end check on the box (PASS/FAIL per check)")]
