@@ -349,7 +349,7 @@ filling it takes the box down, not just the build.
 
 ## Source branch
 
-The nitro Ozone backend is committed on branch `nitro-ozone` in the Chromium checkout (`/home/kaspar/src/ai/chromium/src` by default; commit `455459e465`, on top of main `f741c8c27f`). Check that branch out before building with `ozone_platform_nitro = true`.
+The nitro Ozone backend is committed on branch `nitro-ozone` in the Chromium checkout (`/home/kaspar/src/ai/chromium/src` by default; commit `455459e465`, on top of main `f741c8c27f`; since then the #3921 dma-buf path, and `b30a7ce0d0`: tiled AR24 for translucent windows while nitro's GPU helper composites them, #3952). Check that branch out before building with `ozone_platform_nitro = true`.
 
 ## 11. Shippable build: `out/Nitro` (#3865)
 

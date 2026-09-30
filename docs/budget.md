@@ -1702,7 +1702,8 @@ Stated budget: server binary +≤80 KB, RssAnon +≤200 KB, helper
 byte-identical, other binaries byte-identical.
 
 - **Server binary: +140 KB** (3 337 416 → 3 481 184 bytes, release,
-  x86-64), **60 KB over budget**. `cargo bloat` diff against 4383588
+  x86-64), **60 KB over budget** — accepted by the human on 2026-09-30.
+  `cargo bloat` diff against 4383588
   (#3946): ~46 KB is `gpu.rs` and the other `gpu_*` code, ~41 KB is
   the mode-2 planner and frame path (`paint`, `paint_shadow`,
   `Planner::decide`), ~30 KB is `std::process::Command` (spawn, and the
@@ -1785,6 +1786,20 @@ byte-identical, other binaries byte-identical.
   Also left: the DRM `read` until `EAGAIN` (inside the `drm` crate) and
   the uevent `recvfrom` on each flip (1 each per frame).
 
+
+## Translucent Surfaces through the GPU helper (#3952)
+
+- **Server binary: +16 KB** (3 481 384 → 3 497 496 bytes, release,
+  x86-64): the O/R split in `gpu_layers`, `opaque_only` holes, the
+  `COMPOSITE` feedback bit, one counter.
+- **RssAnon:** no new per-frame allocation that outlives a frame; one
+  `Vec<(u32, u64)>` of the helper's XR24/AR24 pairs (9 on KBL). Not
+  measurable against the noise.
+- **Helper:** unchanged (it already had `PremulOver` and AR24 sampling).
+- **What it buys** (testhost2, Chromium CSD window, `chromium-bench
+  dmabuf`): server paint 2.7–3.0 ms → **0 ms** (`planes_mode 2`), server
+  CPU over the scroll 24–33 % → **7 %** of a core; the window's buffers
+  are X-tiled AR24 instead of linear. See `docs/chromium.md`.
 
 ## Client dma-bufs (#3918)
 
