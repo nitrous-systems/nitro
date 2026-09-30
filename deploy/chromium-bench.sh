@@ -32,6 +32,15 @@
 #             NITRO_BENCH_VIDEO_CSS=WxH changes the CSS box (1024x576 is
 #             1280x720 device px at scale 1.25: a 720p clip at 1:1).
 #
+# Scroll arms (#3974): NITRO_BENCH_PATTERN picks scroll-bench's input
+# pattern, even | random | burst | all (default even; `all` runs the three
+# in turn on the same chrome), NITRO_BENCH_EVERY the even spacing in ms
+# (default 16; 8 at 120 Hz). The per-stage timeline table follows the i2p
+# row whenever the server has `timeline`. NITRO_BENCH_STAGES=1 also runs
+# chrome with NITRO_TRACE=1 and keeps its log as
+# /tmp/nitro-chromium-bench-MODE-RUN.log (nitro-frame / nitro-stage lines).
+# NITRO_ACK and NITRO_MAX_PENDING, when set, reach chrome unchanged.
+#
 # For each run: starts chrome (a fresh profile under /tmp) on a 1500-row
 # page, waits for it to settle, runs scroll-bench.py over the window
 # (i2p, fps, server paint), samples the chrome tree's CPU over the scroll,
@@ -70,8 +79,15 @@ case $mode in
            [[ ${NITRO_NO_OVERLAYS:-0} == 1 ]] && envs+=(NITRO_NO_OVERLAYS=1) ;;
     *) echo "unknown mode $mode" >&2; exit 2 ;;
 esac
+[[ ${NITRO_BENCH_STAGES:-0} == 1 ]] && envs+=(NITRO_TRACE=1)
+[[ -n ${NITRO_ACK:-} ]] && envs+=(NITRO_ACK="$NITRO_ACK")
+[[ -n ${NITRO_MAX_PENDING:-} ]] && envs+=(NITRO_MAX_PENDING="$NITRO_MAX_PENDING")
 # `env` with no assignments would run nothing extra; keep the array non-empty.
 envs+=(NITRO_BENCH=1)
+pattern=${NITRO_BENCH_PATTERN:-even}
+case $pattern in all) patterns=(even random burst) ;; even|random|burst) patterns=("$pattern") ;;
+    *) echo "NITRO_BENCH_PATTERN is even|random|burst|all" >&2; exit 2 ;; esac
+every=${NITRO_BENCH_EVERY:-16}
 
 # kB of a field in /proc/PID/smaps_rollup (PSS) or status (VmRSS).
 pss() { awk '/^Pss:/{print $2}' "/proc/$1/smaps_rollup" 2>/dev/null || echo 0; }
@@ -165,7 +181,15 @@ for run in $(seq 1 "$runs"); do
     srv=$(pgrep -x nitro-server | head -1 || true)
     sj() { [[ -n $srv ]] && awk '{print $14+$15}' "/proc/$srv/stat" 2>/dev/null || echo 0; }
     j0=$(tree_jiffies); s_j0=$(sj); t0=$(date +%s.%N)
-    row=$(python3 "$here/scroll-bench.py" --label "$mode #$run" 2>&1 | tail -3)
+    row=""
+    for p in "${patterns[@]}"; do
+        # Everything but the trailing server summary line: the i2p row and
+        # the stage table.
+        row+=$(python3 "$here/scroll-bench.py" --label "$mode #$run" --pattern "$p" --every "$every" \
+                   --timeline-out "/tmp/nitro-chromium-bench-$mode-$run-$p.timeline" 2>&1 | sed -n '3,$p')
+        row+=$'\n'
+        sleep 1
+    done
     j1=$(tree_jiffies); s_j1=$(sj); t1=$(date +%s.%N)
     cpu=$(python3 -c "print(round(($j1-$j0)/$(getconf CLK_TCK)/($t1-$t0)*100))")
     scpu=$(python3 -c "print(round(($s_j1-$s_j0)/$(getconf CLK_TCK)/($t1-$t0)*100))")
@@ -173,6 +197,7 @@ for run in $(seq 1 "$runs"); do
     echo "  server: dmabuf_buffers/fence_waits/placeholder_paints before $s0, after $(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints); planes_mode $(stat planes_mode), gpu_frames $(stat gpu_frames), gpu_translucent_approx $(stat gpu_translucent_approx)"
     echo "  mem idle: browser PSS $((b_pss/1024)) MB (RSS $((b_rss/1024))), gpu PSS $((g_pss/1024)) MB (RSS $((g_rss/1024))), tree PSS $((tree_pss/1024)) MB; chrome CPU over scroll ${cpu}% of one core, nitro-server ${scpu}%"
     grep -m6 -E "NITRO_GPU|nitro: GBM|dma-buf|GPU raster|the server lacks|FATAL|GPU process has crashed|GL_RENDERER|ANGLE" "$prof/log" | cut -c1-200 | sed 's/^/  log: /' || true
+    [[ ${NITRO_BENCH_STAGES:-0} == 1 ]] && cp "$prof/log" "/tmp/nitro-chromium-bench-$mode-$run.log"
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     # The browser's children may still be writing the profile.
