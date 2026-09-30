@@ -670,6 +670,42 @@ fn dragging_the_title_bar_moves_the_window_by_the_drag_delta() {
     h.quit();
 }
 
+/// A window dragged off the left and bottom edges keeps following the
+/// pointer once both its centre and its top-left corner are off screen.
+/// `move_window` used to return when neither point was on an output, which
+/// froze a drag with the window about half off the left edge (and off the
+/// bottom, when also off the left) although `clamp_to_desktop` allows
+/// all but a title bar's worth to hang off.
+#[test]
+fn a_window_can_be_dragged_mostly_off_the_left_and_bottom_edges() {
+    let mut h = Harness::start("drag-off", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("drag-off");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "drag-off", WIN, RED, 0, 1);
+    let before = win.frame(true);
+
+    // Grabbed a third of the way in, so the pointer stays on screen.
+    let (bx, by) = win.title_bar();
+    let target = Point::new(-40.0, OUT.1 as f32 - 40.0);
+    assert!(
+        target.y + before.h / 2.0 > OUT.1 as f32 && target.x < 0.0,
+        "the target has both the centre and the corner off screen"
+    );
+    let (dx, dy) = (target.x - before.x, target.y - before.y);
+    h.drag((bx, by), (bx + dx, by + dy), OUT);
+
+    refresh(&mut conn, &mut inbox, &mut win);
+    let after = win.frame(true);
+    assert_eq!(
+        (after.x, after.y),
+        (target.x, target.y),
+        "the frame followed the pointer off the left and bottom edges"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
 #[test]
 fn dragging_an_edge_resizes_and_configures_the_client() {
     let mut h = Harness::start("resize", OUT.0, OUT.1);

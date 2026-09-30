@@ -6205,11 +6205,18 @@ impl Server {
         // predict: a window is on the screen it mostly is on, and dragging
         // it more than halfway across hands it over.
         let centre = Point::new(position.x + size.w / 2.0, position.y + size.h / 2.0);
-        // Off every screen — only reachable while a hotplug is in flight.
-        // Keep the window where it is rather than unplacing it.
-        let Some((output, _)) = self
+        // Neither the centre nor the corner on any screen is routine, not
+        // just a hotplug race: `clamp_to_desktop` lets a window hang off
+        // the left or bottom edge until only a title bar's worth shows,
+        // and past halfway both points are off. The window stays on the
+        // output it is on — returning here instead froze a drag with the
+        // window half off the left edge.
+        let Some(output) = self
             .output_for(centre)
             .or_else(|| self.output_for(position))
+            .map(|(id, _)| id)
+            .or(current)
+            .or_else(|| self.primary_output())
         else {
             return;
         };
